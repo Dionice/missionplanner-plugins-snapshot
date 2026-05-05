@@ -24,6 +24,8 @@ namespace MissionPlanner.plugins
         private Panel _tabHostPanel;
         private Esp32VtxControlView _view;
         private VtxPluginStateStore _stateStore;
+        private bool _wasConnected = false;
+        private string _lastMode = null;
 
         public override string Name
         {
@@ -154,6 +156,25 @@ namespace MissionPlanner.plugins
                 {
                     _view.EnsureMapQuickControlsHosted();
                 }
+
+                var isConnected = MainV2.comPort != null
+                    && MainV2.comPort.BaseStream != null
+                    && MainV2.comPort.BaseStream.IsOpen;
+                if (isConnected && !_wasConnected && _view != null)
+                {
+                    _view.AutoSendOnConnect();
+                }
+                _wasConnected = isConnected;
+
+                var currentMode = MainV2.comPort?.MAV?.cs?.mode;
+                if (_lastMode == "INITIALISING"
+                    && !string.IsNullOrEmpty(currentMode)
+                    && currentMode != "INITIALISING"
+                    && _view != null)
+                {
+                    _view.AutoSendOnConnect();
+                }
+                _lastMode = currentMode;
             }
             catch (Exception ex)
             {
@@ -544,7 +565,7 @@ namespace MissionPlanner.plugins
             var split = new SplitContainer();
             split.Dock = DockStyle.Fill;
             split.FixedPanel = FixedPanel.Panel1;
-            split.Panel1MinSize = 132;
+            split.Panel1MinSize = 90;
             root.Controls.Add(split, 0, 0);
 
             split.Panel1.Controls.Add(BuildInstancesPane());
@@ -553,18 +574,18 @@ namespace MissionPlanner.plugins
             {
                 try
                 {
-                    if (split.Width <= 560)
+                    if (split.Width <= 300)
                     {
                         return;
                     }
 
-                    var maxDistance = split.Width - 360;
+                    var maxDistance = split.Width - 220;
                     if (maxDistance < split.Panel1MinSize)
                     {
                         return;
                     }
 
-                    var distance = Math.Max(split.Panel1MinSize, Math.Min(136, maxDistance));
+                    var distance = Math.Max(split.Panel1MinSize, Math.Min(100, maxDistance));
                     if (split.SplitterDistance != distance)
                     {
                         split.SplitterDistance = distance;
@@ -712,15 +733,15 @@ namespace MissionPlanner.plugins
 
             _bandSelector.DropDownStyle = ComboBoxStyle.DropDownList;
             _bandSelector.SelectedIndexChanged += BandSelectorOnSelectedIndexChanged;
-            ConfigureCompactDropDown(_bandSelector, 180);
+            ConfigureCompactDropDown(_bandSelector, 110);
 
             _channelSelector.DropDownStyle = ComboBoxStyle.DropDownList;
             _channelSelector.SelectedIndexChanged += AnyEditorChanged;
-            ConfigureCompactDropDown(_channelSelector, 180);
+            ConfigureCompactDropDown(_channelSelector, 130);
 
             _powerSelector.DropDownStyle = ComboBoxStyle.DropDownList;
             _powerSelector.SelectedIndexChanged += AnyEditorChanged;
-            ConfigureCompactDropDown(_powerSelector, 120);
+            ConfigureCompactDropDown(_powerSelector, 75);
 
             layout.Controls.Add(BuildCompactFieldRow("Band", _bandSelector), 0, 0);
             layout.Controls.Add(BuildCompactFieldRow("Channel", _channelSelector), 0, 1);
@@ -752,7 +773,7 @@ namespace MissionPlanner.plugins
             var label = new Label();
             label.Dock = DockStyle.Fill;
             label.AutoSize = true;
-            label.MaximumSize = new Size(760, 0);
+            label.MaximumSize = new Size(460, 0);
             label.Padding = new Padding(2, 0, 2, 0);
             label.ForeColor = Color.White;
             label.Text = "Use Instance Settings for routing and table selection. On the main panel, choose band, channel, and power for the selected instance, then send the command.";
@@ -1412,6 +1433,83 @@ namespace MissionPlanner.plugins
                 instance.VtxNodeId,
                 instance.VtxDeviceId,
                 tableName);
+        }
+
+        public void AutoSendOnConnect()
+        {
+            if (_stateStore.State.Instances == null)
+            {
+                return;
+            }
+
+            foreach (var instance in _stateStore.State.Instances)
+            {
+                TrySendCurrentSelection(instance, "on connect");
+            }
+        }
+
+        private bool TrySendCurrentSelection(VtxControlInstanceState instance, string reason)
+        {
+            if (instance == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (MainV2.comPort == null || MainV2.comPort.BaseStream == null || !MainV2.comPort.BaseStream.IsOpen)
+                {
+                    return false;
+                }
+
+                var table = FindTableById(instance.TableId);
+                if (table == null || table.Table == null || table.Table.VtxTable == null)
+                {
+                    AppendLog("Auto-send skipped (" + reason + "): no table for " + instance.Name + ".");
+                    return false;
+                }
+
+                if (table.Table.VtxTable.BandsList == null
+                    || instance.SelectedBandIndex < 0
+                    || instance.SelectedBandIndex >= table.Table.VtxTable.BandsList.Count)
+                {
+                    AppendLog("Auto-send skipped (" + reason + "): invalid band for " + instance.Name + ".");
+                    return false;
+                }
+
+                var band = table.Table.VtxTable.BandsList[instance.SelectedBandIndex];
+                if (band.Frequencies == null
+                    || instance.SelectedChannelIndex < 0
+                    || instance.SelectedChannelIndex >= band.Frequencies.Count)
+                {
+                    AppendLog("Auto-send skipped (" + reason + "): invalid channel for " + instance.Name + ".");
+                    return false;
+                }
+
+                var powerIndex = instance.SelectedPowerValue;
+                var bandItem = new BandItem(instance.SelectedBandIndex, band);
+                var channelItem = new ChannelItem(instance.SelectedChannelIndex, band.Frequencies[instance.SelectedChannelIndex]);
+                var powerLevel = table.Table.VtxTable.PowerlevelsList != null
+                    && powerIndex >= 0
+                    && powerIndex < table.Table.VtxTable.PowerlevelsList.Count
+                    ? table.Table.VtxTable.PowerlevelsList[powerIndex]
+                    : null;
+                var powerDisplay = powerLevel != null
+                    ? new PowerItem(powerIndex, powerLevel).DisplayName
+                    : powerIndex.ToString(CultureInfo.InvariantCulture);
+
+                SendVtxCommand(instance, bandItem, channelItem, powerIndex, powerDisplay);
+                AppendLog("Auto-sent (" + reason + "): " + instance.Name
+                    + " band=" + bandItem.BandDisplay
+                    + " ch=" + channelItem.DisplayName
+                    + " power=" + powerDisplay + ".");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AppendLog("Auto-send failed (" + reason + ") for " + (instance.Name ?? "?") + ": " + ex.Message);
+                return false;
+            }
         }
 
         private void SendQuickPower(VtxControlInstanceState instance, int powerIndex)
