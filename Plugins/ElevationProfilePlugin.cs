@@ -1,11 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using GMap.NET;
+using GMap.NET.Drawing;
+using GMap.NET.WindowsForms;
 using MissionPlanner.Plugin;
 using MissionPlanner.Utilities;
 using ZedGraph;
@@ -13,7 +18,7 @@ using ZedGraph;
 public class ElevationProfilePlugin : Plugin
 {
     public override string Name    => "Elevation Profile";
-    public override string Version => "0.3";
+    public override string Version => "0.4";
     public override string Author  => "GitHub Copilot";
 
     // ── map-overlay panel ────────────────────────────────────────────────────
@@ -53,6 +58,39 @@ public class ElevationProfilePlugin : Plugin
     // ── map-overlay min-alt label (shown when _minAltOnly is true) ───────────
     private System.Windows.Forms.Label _minAltMapLabel;
 
+    // ── viewshed map overlay ──────────────────────────────────────────────────
+    private Bitmap          _viewshedBitmap;
+    private RectLatLng      _viewshedBounds;
+    private readonly object _vsLock       = new object();
+    private CancellationTokenSource _vsCts;
+    private bool            _vsEnabled    = false;
+    private int             _vsResDiv     = 3;   // bitmap pixel : screen pixel ratio
+    private double          _lastMapZoom  = -1;
+    private PointLatLng     _lastMapCenter;
+    private GMapControl     _vsGmap;
+
+    // ── terrain gradient overlay ──────────────────────────────────────────────
+    private Bitmap          _terBitmap;
+    private RectLatLng      _terBounds;
+    private readonly object _terLock      = new object();
+    private CancellationTokenSource _terCts;
+    private bool            _terEnabled   = false;
+
+    // ── GMap overlay layer (index 0 = behind all markers) ────────────────────
+    private GMapOverlay          _overlayLayer;
+    private BitmapOverlayMarker  _overlayMarker;
+
+    // ── cursor altitude tooltip label ─────────────────────────────────────────
+    private System.Windows.Forms.Label _cursorAltLabel;
+
+    // ── SRTM retry flags (auto-refresh when tiles finish downloading) ─────────
+    private volatile bool _vsMissingTiles  = false;
+    private volatile bool _terMissingTiles = false;
+
+    // ── simulated plane altitude (for elevation planning only) ────────────────
+    private bool   _simAltEnabled = false;
+    private double _simAltM       = 100.0;
+
     // ────────────────────────────────────────────────────────────────────────
     public override bool Init()
     {
@@ -60,6 +98,15 @@ public class ElevationProfilePlugin : Plugin
         _sampleSpacingM = Host.config.GetInt32("ElevationProfile.SampleSpacingM", 10);
         _heightLocked   = (Host.config["ElevationProfile.HeightLocked"] ?? "True").ToString() != "False";
         _minAltOnly     = (Host.config["ElevationProfile.MinAltOnly"]   ?? "False").ToString() == "True";
+        _vsEnabled      = (Host.config["ElevationProfile.ViewshedEnabled"] ?? "False").ToString() == "True";
+        _vsResDiv       = Host.config.GetInt32("ElevationProfile.ViewshedResDiv", 3);
+        _terEnabled     = (Host.config["ElevationProfile.TerEnabled"] ?? "False").ToString() == "True";
+        _simAltEnabled  = (Host.config["ElevationProfile.SimAltEnabled"] ?? "False").ToString() == "True";
+        if (double.TryParse(Host.config["ElevationProfile.SimAltM"]?.ToString() ?? "",
+                            NumberStyles.Any, CultureInfo.InvariantCulture, out double sa))
+            _simAltM = sa;
+        // enforce mutual exclusion — terrain takes priority
+        if (_terEnabled && _vsEnabled) _vsEnabled = false;
         return true;
     }
 
@@ -184,6 +231,27 @@ public class ElevationProfilePlugin : Plugin
                     var gmap = Host.FDGMapControl;
                     if (gmap != null)
                     {
+                        _vsGmap = gmap;
+                        gmap.MouseMove  += OnGmapMouseMove;
+                        gmap.MouseLeave += OnGmapMouseLeave;
+
+                        // insert behind all existing overlays (plane, waypoints, etc.)
+                        _overlayMarker = new BitmapOverlayMarker(this, gmap.Position);
+                        _overlayLayer  = new GMapOverlay("ep_bitmap_overlay") { IsVisibile = true };
+                        _overlayLayer.Markers.Add(_overlayMarker);
+                        gmap.Overlays.Insert(0, _overlayLayer);
+
+                        _cursorAltLabel = new System.Windows.Forms.Label()
+                        {
+                            AutoSize  = true,
+                            Padding   = new Padding(4, 2, 4, 2),
+                            BackColor = Color.FromArgb(200, 30, 30, 30),
+                            ForeColor = Color.White,
+                            Font      = new Font("Segoe UI", 8.5f),
+                            Visible   = false
+                        };
+                        gmap.Controls.Add(_cursorAltLabel);
+
                         _minAltMapLabel = new System.Windows.Forms.Label()
                         {
                             AutoSize  = false,
@@ -408,13 +476,144 @@ public class ElevationProfilePlugin : Plugin
                 _tabPage.Controls.Add(chkMinAlt);
                 y += rowH + 6;
                 var btnRefresh = new Button() { Left = x1,       Top = y, Width = 110, Height = 26, Text = "Force Refresh" };
-                btnRefresh.Click += (s, e) => { _firstLoop = true; };
+                btnRefresh.Click += (s, e) =>
+                {
+                    _firstLoop = true;
+                    lock (_vsLock) { _viewshedBitmap?.Dispose(); _viewshedBitmap = null; }
+                    lock (_terLock) { _terBitmap?.Dispose(); _terBitmap = null; }
+                };
                 _tabPage.Controls.Add(btnRefresh);
 
                 var btnToggle = new Button() { Left = x1 + 118, Top = y, Width = 110, Height = 26, Text = "Show / Hide" };
                 btnToggle.Click += (s, e) => ToggleVisible();
                 _tabPage.Controls.Add(btnToggle);
                 y += rowH + 10;
+
+                // ── map overlay mode (radio buttons, mutually exclusive) ────
+                _tabPage.Controls.Add(new System.Windows.Forms.Label()
+                {
+                    Left = x1, Top = y, Width = 300, Height = 18,
+                    Text = "Map overlay mode:", Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
+                });
+                y += 20;
+
+                var rbNone = new RadioButton()
+                    { Left = x1, Top = y, Width = 240, Text = "None",
+                      Checked = !_terEnabled && !_vsEnabled };
+                _tabPage.Controls.Add(rbNone);
+                y += rowH;
+
+                var rbTer = new RadioButton()
+                    { Left = x1, Top = y, Width = 240, Text = "Elevation gradient map",
+                      Checked = _terEnabled };
+                _tabPage.Controls.Add(rbTer);
+                y += rowH;
+
+                var rbVs = new RadioButton()
+                    { Left = x1, Top = y, Width = 240, Text = "Viewshed (line-of-sight)",
+                      Checked = _vsEnabled };
+                _tabPage.Controls.Add(rbVs);
+                y += rowH + 6;
+
+                Action applyOverlayMode = () =>
+                {
+                    bool newTer = rbTer.Checked;
+                    bool newVs  = rbVs.Checked;
+
+                    if (!newTer && _terEnabled)
+                    {
+                        _terEnabled = false;
+                        Host.config["ElevationProfile.TerEnabled"] = "False";
+                        lock (_terLock) { _terBitmap?.Dispose(); _terBitmap = null; }
+                    }
+                    else if (newTer && !_terEnabled)
+                    {
+                        _terEnabled = true;
+                        Host.config["ElevationProfile.TerEnabled"] = "True";
+                        _firstLoop  = true;
+                    }
+
+                    if (!newVs && _vsEnabled)
+                    {
+                        _vsEnabled = false;
+                        Host.config["ElevationProfile.ViewshedEnabled"] = "False";
+                        lock (_vsLock) { _viewshedBitmap?.Dispose(); _viewshedBitmap = null; }
+                    }
+                    else if (newVs && !_vsEnabled)
+                    {
+                        _vsEnabled = true;
+                        Host.config["ElevationProfile.ViewshedEnabled"] = "True";
+                        _firstLoop  = true;
+                    }
+
+                    try { Host.config.Save(); } catch { }
+                    try { _vsGmap?.Invoke((Action)(() => _vsGmap?.Invalidate())); } catch { }
+                };
+
+                rbNone.CheckedChanged += (s, e) => { if (rbNone.Checked) applyOverlayMode(); };
+                rbTer .CheckedChanged += (s, e) => { if (rbTer.Checked)  applyOverlayMode(); };
+                rbVs  .CheckedChanged += (s, e) => { if (rbVs.Checked)   applyOverlayMode(); };
+
+                // ── overlay resolution divisor ───────────────────────────────
+                _tabPage.Controls.Add(MkLabel("Overlay resolution:", x1, y));
+                var nudResDiv = new NumericUpDown()
+                    { Left = x2, Top = y, Width = 80, Minimum = 1, Maximum = 8, Value = _vsResDiv };
+                nudResDiv.ValueChanged += (s, e) =>
+                {
+                    _vsResDiv = (int)nudResDiv.Value;
+                    Host.config["ElevationProfile.ViewshedResDiv"] = _vsResDiv.ToString();
+                    try { Host.config.Save(); } catch { }
+                    if (_vsEnabled) { lock (_vsLock) { _viewshedBitmap?.Dispose(); _viewshedBitmap = null; } _firstLoop = true; }
+                    if (_terEnabled) { lock (_terLock) { _terBitmap?.Dispose(); _terBitmap = null; } _firstLoop = true; }
+                };
+                _tabPage.Controls.Add(nudResDiv);
+                y += rowH;
+
+                _tabPage.Controls.Add(new System.Windows.Forms.Label()
+                {
+                    Left = x1, Top = y, Width = 320, Height = 20,
+                    Text = "(1=finest but slowest, 8=coarsest but fast)",
+                    ForeColor = Color.DimGray, Font = new Font("Segoe UI", 7.5f)
+                });
+                y += rowH + 4;
+
+                // ── simulated plane altitude ─────────────────────────────────
+                _tabPage.Controls.Add(new System.Windows.Forms.Label()
+                {
+                    Left = x1, Top = y, Width = 300, Height = 18,
+                    Text = "Simulated plane altitude:", Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
+                });
+                y += 20;
+
+                var chkSimAlt = new CheckBox()
+                    { Left = x1, Top = y, Width = 240, Text = "Use simulated altitude (AGL, metres)",
+                      Checked = _simAltEnabled };
+                _tabPage.Controls.Add(chkSimAlt);
+                y += rowH;
+
+                _tabPage.Controls.Add(MkLabel("Altitude (m AGL):", x1, y));
+                var nudSimAlt = new NumericUpDown()
+                    { Left = x2, Top = y, Width = 90, Minimum = 0, Maximum = 10000,
+                      DecimalPlaces = 1, Value = (decimal)Math.Min(10000, Math.Max(0, _simAltM)) };
+                nudSimAlt.ValueChanged += (s, e) =>
+                {
+                    _simAltM = (double)nudSimAlt.Value;
+                    Host.config["ElevationProfile.SimAltM"] = _simAltM.ToString(CultureInfo.InvariantCulture);
+                    try { Host.config.Save(); } catch { }
+                    if (_simAltEnabled && _vsEnabled) { _vsMissingTiles = false; _firstLoop = true; }
+                };
+                _tabPage.Controls.Add(nudSimAlt);
+                y += rowH + 4;
+
+                chkSimAlt.CheckedChanged += (s, e) =>
+                {
+                    _simAltEnabled = chkSimAlt.Checked;
+                    Host.config["ElevationProfile.SimAltEnabled"] = _simAltEnabled.ToString();
+                    try { Host.config.Save(); } catch { }
+                    nudSimAlt.Enabled = _simAltEnabled;
+                    if (_vsEnabled) { lock (_vsLock) { _viewshedBitmap?.Dispose(); _viewshedBitmap = null; } _firstLoop = true; }
+                };
+                nudSimAlt.Enabled = _simAltEnabled;
 
                 // ── hint text ────────────────────────────────────────────────
                 _tabPage.Controls.Add(new System.Windows.Forms.Label()
@@ -491,7 +690,28 @@ public class ElevationProfilePlugin : Plugin
             }
             if (double.IsNaN(tAlt)) tAlt = 0;
 
-            if (double.IsNaN(pLat) || double.IsNaN(tLat)) return true;
+            // map pan/zoom detection — runs regardless of overlay mode
+            bool mapChanged = false;
+            if ((_vsEnabled || _terEnabled) && _vsGmap != null)
+            {
+                double curZoom   = _vsGmap.Zoom;
+                var    curCenter = _vsGmap.Position;
+                if (Math.Abs(curZoom - _lastMapZoom) > 0.01
+                    || Math.Abs(curCenter.Lat - _lastMapCenter.Lat) > 1e-6
+                    || Math.Abs(curCenter.Lng - _lastMapCenter.Lng) > 1e-6)
+                {
+                    mapChanged     = true;
+                    _lastMapZoom   = curZoom;
+                    _lastMapCenter = curCenter;
+                }
+            }
+
+            if (double.IsNaN(pLat) || double.IsNaN(tLat))
+            {
+                // no plane position — still refresh terrain on pan/zoom
+                if (_terEnabled && (mapChanged || _terMissingTiles)) { _terMissingTiles = false; ScheduleTerUpdate(); }
+                return true;
+            }
 
             double dpLat = pLat - _lastPlaneLat,  dpLon = pLon - _lastPlaneLon;
             double dtLat = tLat - _lastTargetLat, dtLon = tLon - _lastTargetLon;
@@ -511,6 +731,9 @@ public class ElevationProfilePlugin : Plugin
                                new PointLatLngAlt(tLat, tLon, 0),
                                pAlt, tAlt);
             }
+
+            if (_vsEnabled  && (changed || mapChanged || _vsMissingTiles))  { _vsMissingTiles  = false; ScheduleViewshedUpdate(new PointLatLng(pLat, pLon), _simAltEnabled ? _simAltM : pAlt); }
+            if (_terEnabled && (changed || mapChanged || _terMissingTiles)) { _terMissingTiles = false; ScheduleTerUpdate(); }
         }
         catch { }
         return true;
@@ -521,9 +744,9 @@ public class ElevationProfilePlugin : Plugin
     {
         lock (_updateLock)
         {
-            try { _cts?.Cancel(); } catch { }
+            var prev = _cts;
             _cts = new CancellationTokenSource();
-            var token = _cts.Token;
+            try { prev?.Cancel(); prev?.Dispose(); } catch { }
 
             if (start.Lat == 0 && start.Lng == 0 && end.Lat == 0 && end.Lng == 0)
             {
@@ -531,13 +754,398 @@ public class ElevationProfilePlugin : Plugin
                 return;
             }
 
-            Task.Run(() => ComputeAndPlotAsync(start, end, planeAlt, targetAlt, token), token);
+            Task.Run(() => ComputeAndPlotAsync(start, end, planeAlt, targetAlt, _cts.Token), _cts.Token);
         }
+    }
+
+    // ── viewshed scheduling ───────────────────────────────────────────────────
+    private void ScheduleViewshedUpdate(PointLatLng planePos, double planeAltAGL)
+    {
+        var prev = _vsCts;
+        _vsCts = new CancellationTokenSource();
+        try { prev?.Cancel(); prev?.Dispose(); } catch { }
+        Task.Run(() => ComputeViewshed(planePos, planeAltAGL, _vsCts.Token), _vsCts.Token);
+    }
+
+    private void ComputeViewshed(PointLatLng planePos, double planeAltAGL, CancellationToken token)
+    {
+        try
+        {
+            var gmap = _vsGmap;
+            if (gmap == null || gmap.IsDisposed) return;
+
+            int scrW = 0, scrH = 0;
+            RectLatLng viewArea = default;
+            gmap.Invoke((Action)(() =>
+            {
+                scrW     = gmap.Width;
+                scrH     = gmap.Height;
+                viewArea = gmap.ViewArea;
+            }));
+
+            if (scrW < 10 || scrH < 10) return;
+            if (token.IsCancellationRequested) return;
+
+            int div  = Math.Max(1, _vsResDiv);
+            int bmpW = Math.Max(4, scrW / div);
+            int bmpH = Math.Max(4, scrH / div);
+
+            // ── compute lat/lng for every grid cell via Mercator math ────────
+            // (avoids blocking the UI thread for a big coordinate batch)
+            double topLat   = viewArea.LocationTopLeft.Lat;
+            double botLat   = viewArea.LocationRightBottom.Lat;
+            double leftLng  = viewArea.LocationTopLeft.Lng;
+            double rightLng = viewArea.LocationRightBottom.Lng;
+
+            double mercTop = Math.Log(Math.Tan(Math.PI / 4.0 + topLat * Math.PI / 180.0 / 2.0));
+            double mercBot = Math.Log(Math.Tan(Math.PI / 4.0 + botLat * Math.PI / 180.0 / 2.0));
+
+            var latRow = new double[bmpH];
+            var lngCol = new double[bmpW];
+            for (int py = 0; py < bmpH; py++)
+            {
+                double t  = (py + 0.5) / bmpH;
+                double my = mercTop + t * (mercBot - mercTop);
+                latRow[py] = (2.0 * Math.Atan(Math.Exp(my)) - Math.PI / 2.0) * 180.0 / Math.PI;
+            }
+            for (int px = 0; px < bmpW; px++)
+                lngCol[px] = leftLng + (px + 0.5) / bmpW * (rightLng - leftLng);
+
+            if (token.IsCancellationRequested) return;
+
+            // ── single-pass SRTM fetch for all grid cells ────────────────────
+            var altGrid = new double[bmpW * bmpH];    // NaN = no data
+            bool missingVsTiles = false;
+            for (int py = 0; py < bmpH; py++)
+            {
+                if (token.IsCancellationRequested) return;
+                for (int px = 0; px < bmpW; px++)
+                {
+                    var r = srtm.getAltitude(latRow[py], lngCol[px]);
+                    if (r.currenttype == srtm.tiletype.invalid) missingVsTiles = true;
+                    altGrid[py * bmpW + px] = r.currenttype == srtm.tiletype.valid
+                        ? r.alt : double.NaN;
+                }
+            }
+
+            if (token.IsCancellationRequested) return;
+
+            // ── locate plane in bitmap coords (unclamped — plane may be off-screen) ──
+            double planeMercY = Math.Log(Math.Tan(Math.PI / 4.0 + planePos.Lat * Math.PI / 180.0 / 2.0));
+            double tPY  = (planeMercY - mercTop) / (mercBot - mercTop);
+            double tPX  = (planePos.Lng - leftLng) / (rightLng - leftLng);
+            // floating-point bitmap coords — may be outside [0, bmpW/bmpH)
+            double ppxF = tPX * bmpW;
+            double ppyF = tPY * bmpH;
+
+            // fetch terrain under the plane directly from SRTM (not from altGrid,
+            // since the plane may be off-screen)
+            var planeSRTM = srtm.getAltitude(planePos.Lat, planePos.Lng);
+            if (planeSRTM.currenttype == srtm.tiletype.invalid) missingVsTiles = true;
+            double planeTerrASL = planeSRTM.currenttype == srtm.tiletype.valid ? planeSRTM.alt : 0;
+            double planeAltASL  = planeTerrASL + planeAltAGL;
+
+            double mPerPxLat = (viewArea.HeightLat * 111320.0) / scrH;
+            double maxDist   = Math.Max(500.0, mPerPxLat * Math.Max(scrW, scrH) * 0.8);
+            double cosLat    = Math.Cos(planePos.Lat * Math.PI / 180.0);
+
+            var bmpData = new byte[bmpW * bmpH * 4]; // BGRA
+
+            for (int py = 0; py < bmpH; py++)
+            {
+                if (token.IsCancellationRequested) return;
+                for (int px = 0; px < bmpW; px++)
+                {
+                    int    idx       = (py * bmpW + px) * 4;
+                    double targetAlt = altGrid[py * bmpW + px];
+
+                    if (double.IsNaN(targetAlt)) continue; // transparent
+
+                    // distance from plane (metres)
+                    double dLat = (latRow[py] - planePos.Lat) * 111320.0;
+                    double dLon = (lngCol[px] - planePos.Lng) * 111320.0 * cosLat;
+                    double dist = Math.Sqrt(dLat * dLat + dLon * dLon);
+
+                    // ── LOS via Bresenham walk on altGrid ─────────────────────
+                    // uses unclamped float plane coords; skips cells outside bitmap
+                    bool blocked = false;
+                    double dpxF  = px - ppxF;
+                    double dpyF  = py - ppyF;
+                    int  steps   = Math.Max(1, Math.Max((int)Math.Abs(dpxF), (int)Math.Abs(dpyF)));
+                    for (int s = 1; s < steps && !blocked; s++)
+                    {
+                        double t  = (double)s / steps;
+                        int    ix = (int)Math.Round(ppxF + t * dpxF);
+                        int    iy = (int)Math.Round(ppyF + t * dpyF);
+                        if (ix < 0 || ix >= bmpW || iy < 0 || iy >= bmpH) continue;
+                        double iAlt = altGrid[iy * bmpW + ix];
+                        if (double.IsNaN(iAlt)) continue;
+                        double losAlt = planeAltASL + t * (targetAlt - planeAltASL);
+                        if (iAlt > losAlt + 0.5) blocked = true;
+                    }
+
+                    if (blocked)
+                    {
+                        bmpData[idx]   = 50;   // B
+                        bmpData[idx+1] = 40;   // G
+                        bmpData[idx+2] = 220;  // R
+                        bmpData[idx+3] = 120;  // A
+                    }
+                    else
+                    {
+                        double tDist   = Math.Min(1.0, dist / maxDist);
+                        bmpData[idx]   = 0;                          // B
+                        bmpData[idx+1] = 210;                        // G
+                        bmpData[idx+2] = (byte)(int)(tDist * 200);  // R
+                        bmpData[idx+3] = (byte)(int)(160 - tDist * 60); // A
+                    }
+                }
+            }
+
+            if (token.IsCancellationRequested) return;
+
+            var newBmp = new Bitmap(bmpW, bmpH, PixelFormat.Format32bppArgb);
+            var bd = newBmp.LockBits(new Rectangle(0, 0, bmpW, bmpH),
+                                     ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            System.Runtime.InteropServices.Marshal.Copy(bmpData, 0, bd.Scan0, bmpData.Length);
+            newBmp.UnlockBits(bd);
+
+            Bitmap oldBmp;
+            lock (_vsLock)
+            {
+                oldBmp          = _viewshedBitmap;
+                _viewshedBitmap = newBmp;
+                _viewshedBounds = viewArea;
+            }
+            oldBmp?.Dispose();
+            if (missingVsTiles) _vsMissingTiles = true;
+
+            try { gmap.Invoke((Action)(() => { if (_overlayMarker != null) _overlayMarker.Position = gmap.Position; gmap.Invalidate(); })); } catch { }
+        }
+        catch { }
+    }
+
+    private void OnGmapMouseMove(object sender, MouseEventArgs e)
+    {
+        if (!(_vsEnabled || _terEnabled) || _vsGmap == null || _cursorAltLabel == null)
+        {
+            if (_cursorAltLabel != null && _cursorAltLabel.Visible)
+                _cursorAltLabel.Visible = false;
+            return;
+        }
+        try
+        {
+            var gm  = _vsGmap;
+            var pos = gm.FromLocalToLatLng(e.X, e.Y);
+            var r   = srtm.getAltitude(pos.Lat, pos.Lng);
+            string text = r.currenttype == srtm.tiletype.valid
+                ? $"{r.alt:0} m"
+                : "-- m";
+
+            _cursorAltLabel.Text = text;
+
+            // position offset from cursor, clamped inside map
+            int lx = e.X + 14;
+            int ly = e.Y - 22;
+            if (lx + _cursorAltLabel.Width  > gm.Width)  lx = e.X - _cursorAltLabel.Width  - 4;
+            if (ly < 0)                                   ly = e.Y + 14;
+
+            _cursorAltLabel.Left    = lx;
+            _cursorAltLabel.Top     = ly;
+            _cursorAltLabel.Visible = true;
+            _cursorAltLabel.BringToFront();
+        }
+        catch { }
+    }
+
+    private void OnGmapMouseLeave(object sender, EventArgs e)
+    {
+        try { if (_cursorAltLabel != null) _cursorAltLabel.Visible = false; } catch { }
+    }
+
+    // ── bitmap overlay marker (renders behind all GMap marker overlays) ────────
+    private class BitmapOverlayMarker : GMapMarker
+    {
+        private readonly ElevationProfilePlugin _p;
+        public BitmapOverlayMarker(ElevationProfilePlugin p, PointLatLng pos) : base(pos)
+        {
+            _p = p;
+            IsVisible = true;
+        }
+
+        public override void OnRender(IGraphics g)
+        {
+            var gm = _p._vsGmap;
+            if (gm == null || gm.IsDisposed) return;
+
+            // GMap pre-applies renderOffset to the Graphics context before calling OnRender,
+            // but FromLatLngToLocal already includes renderOffset (absolute screen coords).
+            // Reset to identity so both use the same coordinate space, then restore.
+            System.Drawing.Drawing2D.Matrix savedMatrix    = null;
+            System.Drawing.Drawing2D.Matrix identityMatrix  = null;
+            try
+            {
+                savedMatrix   = g.Transform;
+                identityMatrix = new System.Drawing.Drawing2D.Matrix();
+                g.Transform   = identityMatrix;
+            }
+            catch { }
+
+            // terrain gradient layer (drawn first, behind viewshed)
+            if (_p._terEnabled)
+            {
+                Bitmap bmp; RectLatLng bounds;
+                lock (_p._terLock) { bmp = _p._terBitmap; bounds = _p._terBounds; }
+                DrawBitmap(g, gm, bmp, bounds);
+            }
+
+            // viewshed layer on top
+            if (_p._vsEnabled)
+            {
+                Bitmap bmp; RectLatLng bounds;
+                lock (_p._vsLock) { bmp = _p._viewshedBitmap; bounds = _p._viewshedBounds; }
+                DrawBitmap(g, gm, bmp, bounds);
+            }
+
+            try
+            {
+                if (savedMatrix != null) g.Transform = savedMatrix;
+                savedMatrix?.Dispose();
+                identityMatrix?.Dispose();
+            }
+            catch { }
+        }
+
+        private static void DrawBitmap(IGraphics g, GMapControl gm, Bitmap bmp, RectLatLng bounds)
+        {
+            if (bmp == null) return;
+            try
+            {
+                var tl = gm.FromLatLngToLocal(bounds.LocationTopLeft);
+                var br = gm.FromLatLngToLocal(bounds.LocationRightBottom);
+                int x = (int)tl.X, y = (int)tl.Y;
+                int w = (int)(br.X - tl.X), h = (int)(br.Y - tl.Y);
+                if (w > 0 && h > 0)
+                    g.DrawImage(bmp, new Rectangle(x, y, w, h));
+            }
+            catch { }
+        }
+    }
+
+    // ── terrain gradient scheduling & compute ─────────────────────────────────
+    private void ScheduleTerUpdate()
+    {
+        var prev = _terCts;
+        _terCts = new CancellationTokenSource();
+        try { prev?.Cancel(); prev?.Dispose(); } catch { }
+        Task.Run(() => ComputeTerrain(_terCts.Token), _terCts.Token);
+    }
+
+    private void ComputeTerrain(CancellationToken token)
+    {
+        try
+        {
+            var gmap = _vsGmap;
+            if (gmap == null || gmap.IsDisposed) return;
+
+            int scrW = 0, scrH = 0;
+            RectLatLng viewArea = default;
+            gmap.Invoke((Action)(() =>
+            {
+                scrW     = gmap.Width;
+                scrH     = gmap.Height;
+                viewArea = gmap.ViewArea;
+            }));
+            if (scrW < 10 || scrH < 10 || token.IsCancellationRequested) return;
+
+            int div  = Math.Max(1, _vsResDiv);
+            int bmpW = Math.Max(4, scrW / div);
+            int bmpH = Math.Max(4, scrH / div);
+
+            // compute lat/lng via Mercator math — no UI-thread invoke needed
+            double topLat   = viewArea.LocationTopLeft.Lat;
+            double botLat   = viewArea.LocationRightBottom.Lat;
+            double leftLng  = viewArea.LocationTopLeft.Lng;
+            double rightLng = viewArea.LocationRightBottom.Lng;
+            double mercTopT = Math.Log(Math.Tan(Math.PI / 4.0 + topLat * Math.PI / 180.0 / 2.0));
+            double mercBotT = Math.Log(Math.Tan(Math.PI / 4.0 + botLat * Math.PI / 180.0 / 2.0));
+            var latRowT = new double[bmpH];
+            var lngColT = new double[bmpW];
+            for (int py = 0; py < bmpH; py++)
+            {
+                double t  = (py + 0.5) / bmpH;
+                double my = mercTopT + t * (mercBotT - mercTopT);
+                latRowT[py] = (2.0 * Math.Atan(Math.Exp(my)) - Math.PI / 2.0) * 180.0 / Math.PI;
+            }
+            for (int px = 0; px < bmpW; px++)
+                lngColT[px] = leftLng + (px + 0.5) / bmpW * (rightLng - leftLng);
+
+            if (token.IsCancellationRequested) return;
+
+            // collect altitudes and find min/max
+            var terrAlts = new double[bmpW * bmpH];
+            bool missingTerTiles = false;
+            double minAlt = double.MaxValue, maxAlt = double.MinValue;
+            for (int py = 0; py < bmpH; py++)
+            {
+                if (token.IsCancellationRequested) return;
+                for (int px = 0; px < bmpW; px++)
+                {
+                    var r = srtm.getAltitude(latRowT[py], lngColT[px]);
+                    if (r.currenttype == srtm.tiletype.valid)
+                    {
+                        terrAlts[py * bmpW + px] = r.alt;
+                        if (r.alt < minAlt) minAlt = r.alt;
+                        if (r.alt > maxAlt) maxAlt = r.alt;
+                    }
+                    else
+                    {
+                        if (r.currenttype == srtm.tiletype.invalid) missingTerTiles = true;
+                        terrAlts[py * bmpW + px] = double.NaN;
+                    }
+                }
+            }
+            if (token.IsCancellationRequested) return;
+
+            double range = maxAlt - minAlt;
+            if (range < 1.0) range = 1.0;
+
+            // second pass: assign colors (blue→cyan→green→yellow→red)
+            var bmpData = new byte[bmpW * bmpH * 4];
+            for (int i = 0; i < bmpW * bmpH; i++)
+            {
+                int idx = i * 4;
+                if (double.IsNaN(terrAlts[i])) { bmpData[idx+3] = 0; continue; }
+                double t = (terrAlts[i] - minAlt) / range; // 0=low, 1=high
+                int rv, gv, bv;
+                if      (t < 0.25) { double s = t / 0.25;        rv = 0;            gv = (int)(s * 255);       bv = 255; }
+                else if (t < 0.5)  { double s = (t-0.25)/0.25;   rv = 0;            gv = 255;                  bv = (int)((1-s)*255); }
+                else if (t < 0.75) { double s = (t-0.5)/0.25;    rv = (int)(s*255); gv = 255;                  bv = 0; }
+                else               { double s = (t-0.75)/0.25;   rv = 255;          gv = (int)((1-s)*255);     bv = 0; }
+                bmpData[idx]   = (byte)bv;
+                bmpData[idx+1] = (byte)gv;
+                bmpData[idx+2] = (byte)rv;
+                bmpData[idx+3] = 140;
+            }
+            if (token.IsCancellationRequested) return;
+
+            var newBmp = new Bitmap(bmpW, bmpH, PixelFormat.Format32bppArgb);
+            var bd = newBmp.LockBits(new Rectangle(0, 0, bmpW, bmpH),
+                                     ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            System.Runtime.InteropServices.Marshal.Copy(bmpData, 0, bd.Scan0, bmpData.Length);
+            newBmp.UnlockBits(bd);
+
+            Bitmap oldBmp;
+            lock (_terLock) { oldBmp = _terBitmap; _terBitmap = newBmp; _terBounds = viewArea; }
+            oldBmp?.Dispose();
+            if (missingTerTiles) _terMissingTiles = true;
+            try { gmap.Invoke((Action)(() => { if (_overlayMarker != null) _overlayMarker.Position = gmap.Position; gmap.Invalidate(); })); } catch { }
+        }
+        catch { }
     }
 
     private void ShowPlaceholder()
     {
-        if (_zg == null) return;
         var gp = _zg.GraphPane;
         gp.CurveList.Clear();
         gp.GraphObjList.Clear();
@@ -704,7 +1312,34 @@ public class ElevationProfilePlugin : Plugin
     // ── Exit ──────────────────────────────────────────────────────────────────
     public override bool Exit()
     {
-        try { _cts?.Cancel(); } catch { }
+        try { _cts?.Cancel();  } catch { }
+        try { _vsCts?.Cancel(); } catch { }
+        try { _terCts?.Cancel(); } catch { }
+
+        lock (_terLock)
+        {
+            _terBitmap?.Dispose();
+            _terBitmap = null;
+        }
+
+        try
+        {
+            if (_vsGmap != null)
+            {
+                _vsGmap.MouseMove   -= OnGmapMouseMove;
+                _vsGmap.MouseLeave  -= OnGmapMouseLeave;
+                try { _vsGmap.Overlays.Remove(_overlayLayer); } catch { }
+                _overlayLayer?.Clear();
+                _vsGmap = null;
+            }
+        }
+        catch { }
+
+        lock (_vsLock)
+        {
+            _viewshedBitmap?.Dispose();
+            _viewshedBitmap = null;
+        }
 
         try
         {
@@ -725,10 +1360,17 @@ public class ElevationProfilePlugin : Plugin
             if (_parent != null && _panel != null && _parent.Controls.Contains(_panel))
                 _parent.Controls.Remove(_panel);
             var gmap = Host.FDGMapControl;
-            if (gmap != null && _minAltMapLabel != null && gmap.Controls.Contains(_minAltMapLabel))
-                gmap.Controls.Remove(_minAltMapLabel);
+            if (gmap != null)
+            {
+                if (_minAltMapLabel != null && gmap.Controls.Contains(_minAltMapLabel))
+                    gmap.Controls.Remove(_minAltMapLabel);
+                if (_cursorAltLabel != null && gmap.Controls.Contains(_cursorAltLabel))
+                    gmap.Controls.Remove(_cursorAltLabel);
+            }
             _minAltMapLabel?.Dispose();
             _minAltMapLabel = null;
+            _cursorAltLabel?.Dispose();
+            _cursorAltLabel = null;
             Host.config["ElevationProfile.Width"] = _panel?.Width.ToString() ?? "350";
             try { Host.config.Save(); } catch { }
             _panel?.Dispose();

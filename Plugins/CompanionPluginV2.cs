@@ -6,6 +6,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
 using System.Net.WebSockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -159,8 +160,10 @@ namespace CompanionPlugin
         private CheckBox chkUseRcControl;
         // drag/drop state
         private bool _isDraggingTarget = false;
+        private int _draggingTargetIdx = -1;    // which swarm target is being dragged (-1 = none)
         private bool _isDraggingPlane = false;
         private bool _prevCanDragMap = true;
+        private static readonly Color[] TargetColors = { Color.FromArgb(255,80,0), Color.FromArgb(0,180,255), Color.FromArgb(220,0,255), Color.FromArgb(255,20,20), Color.FromArgb(255,230,0), Color.FromArgb(0,240,240), Color.FromArgb(255,0,140), Color.FromArgb(255,140,0) };
         
         private bool _markerMouseOver = false;
         private bool _markerHandlersAttached = false;
@@ -186,6 +189,10 @@ namespace CompanionPlugin
         private NumericUpDown nudConeAngle;
         private Label tabLblConeOffset;
         private NumericUpDown nudConeOffset;
+        // Gimbal yaw calibration offset (degrees added to computed yaw before MAVLink command)
+        private double gimbalYawCalibOffset = 0.0;
+        private Label tabLblGimbalYawCalib;
+        private NumericUpDown nudGimbalYawCalib;
         // Gimbal RC/PWM configuration
         private const int GIMBAL_PWM_MIN = 500;
         private const int GIMBAL_PWM_MAX = 2500;
@@ -195,7 +202,28 @@ namespace CompanionPlugin
         private const int GIMBAL_RC_CHANNEL_PITCH_IDX = 15; // channel index (1-based) for pitch
         private const int GIMBAL_RC_CHANNEL_YAW_IDX = 16;   // channel index (1-based) for yaw
 
+        // swarm multi-target support
+        private List<SwarmTarget> swarmTargets = new List<SwarmTarget>();
+        private int activeTargetIdx = 0;
+        private int _lastActiveTargetIdxFromSettings = -1;
+        // swarm UI controls
+        private Label lblSwarmTargets;
+        private ListBox lstTargets;
+        private Button btnAddTarget;
+        private Button btnRemoveTarget;
+        private Button btnRenameTarget;
+
         // use Newtonsoft.Json (already referenced in project)
+
+        // mavp2p process handle
+        private Process _mavp2pProcess = null;
+        // LinkApp header button
+        private ToolStripButton _linkAppBtn = null;
+        private Process _linkAppProcess = null;
+
+        [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        private const int SW_RESTORE = 9;
 
         public override bool Init()
         {
@@ -251,23 +279,18 @@ namespace CompanionPlugin
                             UpdatePlaneMarker(new PointLatLng(planeLat, planeLon));
                         }
                     }
-                    if (s["Companion_target_lat"] != null && s["Companion_target_lon"] != null)
-                    {
-                        double lat, lon;
-                        if (double.TryParse(s["Companion_target_lat"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out lat) &&
-                            double.TryParse(s["Companion_target_lon"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out lon))
-                        {
-                            targetLat = lat; targetLon = lon;
-                            UpdateTargetMarker(new PointLatLng(targetLat, targetLon));
-                        }
-                    }
-                    // load persisted target altitude (optional)
+                    // load swarm targets (migrates legacy single-target settings on first run)
+                    try { LoadSwarmTargets(); } catch { }
+                    // keep targetAlt in sync for UI (LoadSwarmTargets sets it but nudTargetAlt is created later)
+                    // also load persisted target alt as fallback (used by nudTargetAlt init below)
                     if (s["Companion_target_alt"] != null)
                     {
                         double altv;
                         if (double.TryParse(s["Companion_target_alt"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out altv))
                         {
-                            targetAlt = altv;
+                            // only apply if LoadSwarmTargets did not set targetAlt from swarm data
+                            if (swarmTargets == null || swarmTargets.Count == 0)
+                                targetAlt = altv;
                         }
                     }
                     // load persisted min/max target altitude (optional)
@@ -296,10 +319,112 @@ namespace CompanionPlugin
                             planeAltTriggerDelta = Math.Max(1, dv);
                         }
                     }
+                    if (s["Companion_gimbal_yaw_calib"] != null)
+                    {
+                        double cv;
+                        if (double.TryParse(s["Companion_gimbal_yaw_calib"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out cv))
+                            gimbalYawCalibOffset = cv;
+                    }
                 }
                 catch { }
 
                 StartServer();
+                StartMavp2p();
+                // add LinkApp button to the main header menu
+                try
+                {
+                    if (MainV2.instance != null && MainV2.instance.MainMenu != null)
+                    {
+                        _linkAppBtn = new ToolStripButton("LinkApp")
+                        {
+                            ToolTipText = "Launch LinkAppW",
+                            ForeColor = System.Drawing.Color.White,
+                            Margin = new System.Windows.Forms.Padding(4, 0, 4, 0),
+                            ImageScaling = ToolStripItemImageScaling.None
+                        };
+                        // load icon immediately from the exe if path is already known
+                        try
+                        {
+                            var stInit = MissionPlanner.Utilities.Settings.Instance;
+                            string mavp2pPathInit = stInit["Companion_mavp2p_path"] != null ? stInit["Companion_mavp2p_path"].ToString() : null;
+                            if (!string.IsNullOrEmpty(mavp2pPathInit) && File.Exists(mavp2pPathInit))
+                            {
+                                string linkAppPathInit = Path.Combine(Path.GetDirectoryName(mavp2pPathInit), "LinkAppW-v1.7.3-signed.exe");
+                                if (File.Exists(linkAppPathInit))
+                                {
+                                    var ico = Icon.ExtractAssociatedIcon(linkAppPathInit);
+                                    if (ico != null)
+                                        _linkAppBtn.Image = new Bitmap(ico.ToBitmap(), new Size(36, 36));
+                                }
+                            }
+                        }
+                        catch { }
+                        _linkAppBtn.Click += (s2, e2) =>
+                        {
+                            try
+                            {
+                                const string settingsKey = "Companion_mavp2p_path";
+                                var st = MissionPlanner.Utilities.Settings.Instance;
+                                string mavp2pPath = st[settingsKey] != null ? st[settingsKey].ToString() : null;
+                                if (string.IsNullOrEmpty(mavp2pPath) || !File.Exists(mavp2pPath))
+                                {
+                                    if (MessageBox.Show("mavp2p.exe path is not configured or no longer valid.\nWould you like to locate it now?", "LinkApp", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                                        return;
+                                    using (var ofd = new OpenFileDialog() { Title = "Locate mavp2p.exe", Filter = "mavp2p.exe|mavp2p.exe|Executables (*.exe)|*.exe|All files (*.*)|*.*", FileName = "mavp2p.exe" })
+                                    {
+                                        if (ofd.ShowDialog() != DialogResult.OK || !File.Exists(ofd.FileName)) return;
+                                        mavp2pPath = ofd.FileName;
+                                        st[settingsKey] = mavp2pPath;
+                                    }
+                                }
+                                string linkAppPath = Path.Combine(Path.GetDirectoryName(mavp2pPath), "LinkAppW-v1.7.3-signed.exe");
+                                if (!File.Exists(linkAppPath))
+                                {
+                                    if (MessageBox.Show($"LinkAppW-v1.7.3-signed.exe not found at:\n{linkAppPath}\n\nWould you like to locate it manually?", "LinkApp", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                                        return;
+                                    using (var ofd = new OpenFileDialog() { Title = "Locate LinkAppW-v1.7.3-signed.exe", Filter = "LinkAppW-v1.7.3-signed.exe|LinkAppW-v1.7.3-signed.exe|Executables (*.exe)|*.exe|All files (*.*)|*.*", FileName = "LinkAppW-v1.7.3-signed.exe" })
+                                    {
+                                        if (ofd.ShowDialog() != DialogResult.OK || !File.Exists(ofd.FileName)) return;
+                                        linkAppPath = ofd.FileName;
+                                    }
+                                }
+                                // update icon if not set yet (e.g. path was just configured)
+                                if (_linkAppBtn != null && _linkAppBtn.Image == null)
+                                {
+                                    try
+                                    {
+                                        var ico = Icon.ExtractAssociatedIcon(linkAppPath);
+                                        if (ico != null)
+                                            _linkAppBtn.Image = new Bitmap(ico.ToBitmap(), new Size(36, 36));
+                                    }
+                                    catch { }
+                                }
+                                // if already running, bring to foreground
+                                try
+                                {
+                                    if (_linkAppProcess != null && !_linkAppProcess.HasExited)
+                                    {
+                                        var hwnd = _linkAppProcess.MainWindowHandle;
+                                        if (hwnd != IntPtr.Zero)
+                                        {
+                                            ShowWindow(hwnd, SW_RESTORE);
+                                            SetForegroundWindow(hwnd);
+                                        }
+                                        return;
+                                    }
+                                }
+                                catch { }
+                                _linkAppProcess = Process.Start(new ProcessStartInfo(linkAppPath) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(linkAppPath) });
+                            }
+                            catch (Exception ex)
+                            {
+                                MessageBox.Show("Failed to launch LinkApp: " + ex.Message, "LinkApp", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            }
+                        };
+                        MainV2.instance.MainMenu.Items.Add(_linkAppBtn);
+                    }
+                }
+                catch { }
                 // add context menu items and a docked tab like the original GimbalTool
                 try
                 {
@@ -480,9 +605,12 @@ namespace CompanionPlugin
                                 try {
                                     double newTargetAlt = (double)nudTargetAlt.Value;
                                     targetAlt = newTargetAlt;
+                                    // sync alt to active swarm target
+                                    try { if (swarmTargets != null && activeTargetIdx >= 0 && activeTargetIdx < swarmTargets.Count) { swarmTargets[activeTargetIdx].Alt = targetAlt; } } catch { }
                                     var st = MissionPlanner.Utilities.Settings.Instance;
                                     st["Companion_target_alt"] = targetAlt.ToString(CultureInfo.InvariantCulture);
                                     try { st.Save(); } catch { }
+                                    try { SaveSwarmTargets(); } catch { }
 
                                     // update UI input value (label remains static)
                                     try { /* tabLblTargetAlt stays as 'Alt:' label */ } catch { }
@@ -586,7 +714,7 @@ namespace CompanionPlugin
                             tabPage.Controls.Add(nudTargetAlt);
                             tabPage.Controls.Add(btnSendTab);
                             // Enable tracks checkbox
-                            chkEnableTracks = new CheckBox() { Left = 6, Top = gmTopBase + 286, Width = 120, Text = "Enable Tracks", Checked = false };
+                            chkEnableTracks = new CheckBox() { Left = 6, Top = gmTopBase + 314, Width = 120, Text = "Enable Tracks", Checked = false };
                             try { var stt = MissionPlanner.Utilities.Settings.Instance; if (stt["Companion_tracks_enabled"] != null) { bool v; if (bool.TryParse(stt["Companion_tracks_enabled"].ToString(), out v)) chkEnableTracks.Checked = v; } } catch { }
                             chkEnableTracks.CheckedChanged += (sChk, eChk) => {
                                 try {
@@ -605,7 +733,7 @@ namespace CompanionPlugin
                             };
                             tabPage.Controls.Add(chkEnableTracks);
                             // per-track visibility toggles
-                            chkShowPlaneTrack = new CheckBox() { Left = 6, Top = gmTopBase + 356, Width = 120, Text = "Show Plane Track", Checked = true };
+                            chkShowPlaneTrack = new CheckBox() { Left = 6, Top = gmTopBase + 384, Width = 120, Text = "Show Plane Track", Checked = true };
                             try { var stp = MissionPlanner.Utilities.Settings.Instance; if (stp["Companion_plane_track_visible"] != null) { bool v; if (bool.TryParse(stp["Companion_plane_track_visible"].ToString(), out v)) chkShowPlaneTrack.Checked = v; } } catch { }
                             chkShowPlaneTrack.CheckedChanged += (spt, ept) => {
                                 try { var stp2 = MissionPlanner.Utilities.Settings.Instance; stp2["Companion_plane_track_visible"] = chkShowPlaneTrack.Checked.ToString(); try { stp2.Save(); } catch { } } catch { }
@@ -631,7 +759,7 @@ namespace CompanionPlugin
                             };
                             tabPage.Controls.Add(chkShowPlaneTrack);
 
-                            chkShowTargetTrack = new CheckBox() { Left = chkShowPlaneTrack.Left + chkShowPlaneTrack.Width + 8, Top = gmTopBase + 356, Width = 120, Text = "Show Target Track", Checked = true };
+                            chkShowTargetTrack = new CheckBox() { Left = chkShowPlaneTrack.Left + chkShowPlaneTrack.Width + 8, Top = gmTopBase + 384, Width = 120, Text = "Show Target Track", Checked = true };
                             try { var stt = MissionPlanner.Utilities.Settings.Instance; if (stt["Companion_target_track_visible"] != null) { bool v; if (bool.TryParse(stt["Companion_target_track_visible"].ToString(), out v)) chkShowTargetTrack.Checked = v; } } catch { }
                             chkShowTargetTrack.CheckedChanged += (stt2, ett2) => {
                                 try { var stt3 = MissionPlanner.Utilities.Settings.Instance; stt3["Companion_target_track_visible"] = chkShowTargetTrack.Checked.ToString(); try { stt3.Save(); } catch { } } catch { }
@@ -657,7 +785,7 @@ namespace CompanionPlugin
                             };
                             tabPage.Controls.Add(chkShowTargetTrack);
                             // Save KML and Clear Tracks buttons
-                            btnSaveKml = new Button() { Left = 6, Top = gmTopBase + 320, Width = 90, Height = 28, Text = "Save KML" };
+                            btnSaveKml = new Button() { Left = 6, Top = gmTopBase + 348, Width = 90, Height = 28, Text = "Save KML" };
                             try { btnSaveKml.FlatStyle = FlatStyle.Flat; btnSaveKml.BackColor = Color.FromArgb(220, 220, 220); } catch { }
                             btnSaveKml.Click += (s4, e4) => { try { SaveKml(); } catch { } };
 
@@ -713,6 +841,105 @@ namespace CompanionPlugin
                             // small spacer line after cone offset
                             var spacerAfterOffset = new Label() { Left = 6, Top = gmTopBase + 280, Width = 10, Height = 8, Text = "" };
                             tabPage.Controls.Add(spacerAfterOffset);
+                            // Yaw calibration offset control
+                            tabLblGimbalYawCalib = new Label() { Left = 6, Top = gmTopBase + 286, AutoSize = true, Text = "Yaw Calib (deg):" };
+                            nudGimbalYawCalib = new NumericUpDown() { Left = tabLblGimbalYawCalib.Left + tabLblGimbalYawCalib.Width + 6, Top = gmTopBase + 282, Width = 80, Minimum = -180, Maximum = 180, DecimalPlaces = 1, Increment = 0.5M };
+                            try { nudGimbalYawCalib.Value = (decimal)gimbalYawCalibOffset; } catch { }
+                            nudGimbalYawCalib.ValueChanged += (sa, ea) => {
+                                try {
+                                    gimbalYawCalibOffset = (double)nudGimbalYawCalib.Value;
+                                    var st = MissionPlanner.Utilities.Settings.Instance;
+                                    st["Companion_gimbal_yaw_calib"] = gimbalYawCalibOffset.ToString(CultureInfo.InvariantCulture);
+                                    try { st.Save(); } catch { }
+                                } catch { }
+                            };
+                            tabPage.Controls.Add(tabLblGimbalYawCalib);
+                            tabPage.Controls.Add(nudGimbalYawCalib);
+                            // --- Swarm Targets section ---
+                            try
+                            {
+                                int swarmTop = gmTopBase + 418;
+                                lblSwarmTargets = new Label() { Left = 6, Top = swarmTop, Width = 120, Text = "Swarm Targets:" };
+                                tabPage.Controls.Add(lblSwarmTargets);
+
+                                lstTargets = new ListBox() { Left = 6, Top = swarmTop + 18, Width = 250, Height = 100 };
+                                tabPage.Controls.Add(lstTargets);
+                                RefreshTargetListUI();
+
+                                btnAddTarget = new Button() { Left = 6, Top = swarmTop + 124, Width = 70, Height = 26, Text = "+ Add" };
+                                btnRemoveTarget = new Button() { Left = 82, Top = swarmTop + 124, Width = 70, Height = 26, Text = "- Remove" };
+                                btnRenameTarget = new Button() { Left = 158, Top = swarmTop + 124, Width = 70, Height = 26, Text = "Rename" };
+
+                                btnAddTarget.Click += (sa, ea) => {
+                                    try {
+                                        var t = new SwarmTarget() { Name = $"Target {swarmTargets.Count + 1}", Lat = targetLat, Lon = targetLon, Alt = targetAlt };
+                                        swarmTargets.Add(t);
+                                        SaveSwarmTargets();
+                                        RefreshTargetListUI();
+                                        // show map marker for new target
+                                        try { FlightData.instance?.BeginInvoke(new Action(() => { try { RefreshAllTargetMarkers(); } catch { } })); } catch { try { RefreshAllTargetMarkers(); } catch { } }
+                                    } catch { }
+                                };
+
+                                btnRemoveTarget.Click += (sa, ea) => {
+                                    try {
+                                        int sel = lstTargets.SelectedIndex;
+                                        if (sel < 0 || swarmTargets.Count <= 1) return; // keep at least one
+                                        // remove map marker
+                                        try {
+                                            var t = swarmTargets[sel];
+                                            if (overlay != null)
+                                            {
+                                                if (t.MapMarker != null && overlay.Markers.Contains(t.MapMarker)) { overlay.Markers.Remove(t.MapMarker); t.MapMarker = null; }
+                                                if (t.AltMarker != null && overlay.Markers.Contains(t.AltMarker)) { overlay.Markers.Remove(t.AltMarker); t.AltMarker = null; }
+                                                if (t.Route != null && overlay.Routes.Contains(t.Route)) { overlay.Routes.Remove(t.Route); t.Route = null; }
+                                            }
+                                        } catch { }
+                                        swarmTargets.RemoveAt(sel);
+                                        // clamp activeTargetIdx
+                                        if (activeTargetIdx >= swarmTargets.Count) activeTargetIdx = swarmTargets.Count - 1;
+                                        SaveSwarmTargets();
+                                        SwitchToTarget(activeTargetIdx);
+                                    } catch { }
+                                };
+
+                                btnRenameTarget.Click += (sa, ea) => {
+                                    try {
+                                        int sel = lstTargets.SelectedIndex;
+                                        if (sel < 0 || sel >= swarmTargets.Count) return;
+                                        var f2 = new Form() { Text = "Rename Target", Size = new Size(320, 120), StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false };
+                                        var lbl2 = new Label() { Left = 10, Top = 12, Width = 280, Text = "New name:" };
+                                        var tb = new TextBox() { Left = 10, Top = 32, Width = 280, Text = swarmTargets[sel].Name };
+                                        var okBtn2 = new Button() { Text = "OK", Left = 120, Top = 60, Width = 80, DialogResult = DialogResult.OK };
+                                        var cancelBtn2 = new Button() { Text = "Cancel", Left = 210, Top = 60, Width = 80, DialogResult = DialogResult.Cancel };
+                                        f2.Controls.Add(lbl2); f2.Controls.Add(tb); f2.Controls.Add(okBtn2); f2.Controls.Add(cancelBtn2);
+                                        f2.AcceptButton = okBtn2; f2.CancelButton = cancelBtn2;
+                                        if (f2.ShowDialog(tabPage.FindForm()) == DialogResult.OK && !string.IsNullOrWhiteSpace(tb.Text))
+                                        {
+                                            swarmTargets[sel].Name = tb.Text.Trim();
+                                            SaveSwarmTargets();
+                                            RefreshTargetListUI();
+                                        }
+                                        f2.Dispose();
+                                    } catch { }
+                                };
+
+                                // switch target when user clicks in the list
+                                bool _suppressListSwitch = false;
+                                lstTargets.SelectedIndexChanged += (sa, ea) => {
+                                    try {
+                                        if (_suppressListSwitch) return;
+                                        int sel = lstTargets.SelectedIndex;
+                                        if (sel >= 0 && sel < swarmTargets.Count && sel != activeTargetIdx)
+                                            SwitchToTarget(sel);
+                                    } catch { }
+                                };
+
+                                tabPage.Controls.Add(btnAddTarget);
+                                tabPage.Controls.Add(btnRemoveTarget);
+                                tabPage.Controls.Add(btnRenameTarget);
+                            }
+                            catch { }
                             // device IP and port
                             string devip = "unknown";
                             try {
@@ -862,16 +1089,19 @@ namespace CompanionPlugin
                             try { FlightData.instance.gMapControl1.BeginInvoke(new Action(() => UpdatePlaneMarker(new PointLatLng(planeLat, planeLon)))); } catch { UpdatePlaneMarker(new PointLatLng(planeLat, planeLon)); }
                         }
                     }
-                    if (s["Companion_target_lat"] != null && s["Companion_target_lon"] != null
-                        && double.TryParse(s["Companion_target_lat"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out lat)
-                        && double.TryParse(s["Companion_target_lon"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out lon))
-                    {
-                        if (lat != targetLat || lon != targetLon)
+                    // check if active target was switched externally (e.g. by KeyBinder)
+                    try {
+                        if (s["Companion_active_target_idx"] != null)
                         {
-                            targetLat = lat; targetLon = lon;
-                            try { FlightData.instance.gMapControl1.BeginInvoke(new Action(() => UpdateTargetMarker(new PointLatLng(targetLat, targetLon)))); } catch { UpdateTargetMarker(new PointLatLng(targetLat, targetLon)); }
+                            int extIdx;
+                            if (int.TryParse(s["Companion_active_target_idx"].ToString(), out extIdx) && extIdx != _lastActiveTargetIdxFromSettings)
+                            {
+                                _lastActiveTargetIdxFromSettings = extIdx;
+                                int idxCopy = extIdx;
+                                try { FlightData.instance?.BeginInvoke(new Action(() => { try { SwitchToTarget(idxCopy); } catch { } })); } catch { try { SwitchToTarget(idxCopy); } catch { } }
+                            }
                         }
-                    }
+                    } catch { }
                 }
                 catch { }
 
@@ -1507,7 +1737,21 @@ namespace CompanionPlugin
                 s_planeLat = planeLat; s_planeLon = planeLon; s_planeAlt = planeAlt;
                 s_targetLat = targetLat; s_targetLon = targetLon; s_targetAlt = targetAlt; s_targetMin = targetAltMin; s_targetMax = targetAltMax;
             }
-            var obj = new { type = "positions", payload = new { plane = new { lat = s_planeLat, lon = s_planeLon, alt = s_planeAlt }, target = new { lat = s_targetLat, lon = s_targetLon, alt = s_targetAlt, min = s_targetMin, max = s_targetMax } } };
+            // snapshot swarm targets list
+            object[] targetsArr = null;
+            try {
+                if (swarmTargets != null)
+                {
+                    var ta = new List<object>();
+                    for (int i = 0; i < swarmTargets.Count; i++)
+                    {
+                        var t = swarmTargets[i];
+                        ta.Add(new { name = t.Name, lat = t.Lat, lon = t.Lon, alt = t.Alt, active = (i == activeTargetIdx) });
+                    }
+                    targetsArr = ta.ToArray();
+                }
+            } catch { }
+            var obj = new { type = "positions", payload = new { plane = new { lat = s_planeLat, lon = s_planeLon, alt = s_planeAlt }, target = new { lat = s_targetLat, lon = s_targetLon, alt = s_targetAlt, min = s_targetMin, max = s_targetMax }, targets = targetsArr } };
             var s = JsonConvert.SerializeObject(obj);
             var b = Encoding.UTF8.GetBytes(s);
 
@@ -1690,6 +1934,14 @@ namespace CompanionPlugin
                 try { Trace.WriteLine($"UpdateTargetMarker called with p={p.Lat.ToString(CultureInfo.InvariantCulture)},{p.Lng.ToString(CultureInfo.InvariantCulture)} plane={planeLat.ToString(CultureInfo.InvariantCulture)},{planeLon.ToString(CultureInfo.InvariantCulture)}\nCallStack:\n" + Environment.StackTrace); } catch { }
                 // ensure globals reflect this update so broadcasts are accurate
                 try { lock (stateLock) { targetLat = p.Lat; targetLon = p.Lng; } } catch { }
+                // sync active swarm target position
+                try {
+                    if (swarmTargets != null && activeTargetIdx >= 0 && activeTargetIdx < swarmTargets.Count)
+                    {
+                        swarmTargets[activeTargetIdx].Lat = p.Lat;
+                        swarmTargets[activeTargetIdx].Lon = p.Lng;
+                    }
+                } catch { }
 
                 if (overlay == null) return;
                 if (targetMarker != null)
@@ -1698,32 +1950,41 @@ namespace CompanionPlugin
                 }
                 else
                 {
-                    if (targetBmp != null)
+                    // Prefer swarm system to create the marker (avoids a standalone non-swarm marker)
+                    if (swarmTargets != null && swarmTargets.Count > 0)
                     {
-                        targetMarker = new GMarkerGoogle(p, targetBmp) { ToolTipText = "Target" };
-                        targetMarker.Offset = new Point(-targetBmp.Width / 2, -targetBmp.Height / 2);
+                        try { RefreshAllTargetMarkers(); } catch { }
+                        // targetMarker is now set as alias by RefreshAllTargetMarkers; update its position
+                        if (targetMarker != null) targetMarker.Position = p;
                     }
                     else
-                        targetMarker = new GMarkerGoogle(p, GMarkerGoogleType.blue_pushpin) { ToolTipText = "Target" };
-                    overlay.Markers.Add(targetMarker);
-                    // create or update altitude label marker for target
-                    try
                     {
-                        string lbl = $"{targetAlt:F1} m";
-                        if (targetAltMarker == null)
+                        // standalone fallback (no swarm targets)
+                        if (targetBmp != null)
                         {
-                            var txt = new PointLatLng(p.Lat, p.Lng);
-                            var m = new GMapMarkerText(txt, lbl) { PixelOffset = new Point(12, 12) };
-                            targetAltMarker = m;
-                            overlay.Markers.Add(targetAltMarker);
+                            targetMarker = new GMarkerGoogle(p, targetBmp) { ToolTipText = "Target" };
+                            targetMarker.Offset = new Point(-targetBmp.Width / 2, -targetBmp.Height / 2);
                         }
                         else
+                            targetMarker = new GMarkerGoogle(p, GMarkerGoogleType.blue_pushpin) { ToolTipText = "Target" };
+                        overlay.Markers.Add(targetMarker);
+                        try
                         {
-                            targetAltMarker.Position = p;
-                            try { (targetAltMarker as GMapMarkerText).Text = lbl; } catch { }
+                            string lbl = $"{targetAlt:F1} m";
+                            if (targetAltMarker == null)
+                            {
+                                var m = new GMapMarkerText(new PointLatLng(p.Lat, p.Lng), lbl) { PixelOffset = new Point(12, 12) };
+                                targetAltMarker = m;
+                                overlay.Markers.Add(targetAltMarker);
+                            }
+                            else
+                            {
+                                targetAltMarker.Position = p;
+                                try { (targetAltMarker as GMapMarkerText).Text = lbl; } catch { }
+                            }
                         }
+                        catch { }
                     }
-                    catch { }
                 }
                 // update altitude label marker if present
                 try
@@ -1746,6 +2007,7 @@ namespace CompanionPlugin
                         s["Companion_target_lat"] = p.Lat.ToString(CultureInfo.InvariantCulture);
                         s["Companion_target_lon"] = p.Lng.ToString(CultureInfo.InvariantCulture);
                         try { s.Save(); } catch { }
+                        try { SaveSwarmTargets(); } catch { }
                     }
                     catch { }
                 }
@@ -1856,27 +2118,35 @@ namespace CompanionPlugin
                     }
                     catch { }
 
-                    // target track
+                    // per-target swarm tracks
                     try
                     {
-                        if (targetTrackPoints != null && targetTrackPoints.Count > 0)
+                        if (swarmTargets != null)
                         {
-                            sb.AppendLine("<Placemark>");
-                            sb.AppendLine("<name>Target Track</name>");
-                            sb.AppendLine("<styleUrl>#targetLine</styleUrl>");
-                            sb.AppendLine("<LineString>");
-                            sb.AppendLine("<tessellate>1</tessellate>");
-                            sb.AppendLine("<coordinates>");
-                            for (int i = 0; i < targetTrackPoints.Count; i++)
+                            foreach (var tgt in swarmTargets)
                             {
-                                var pt = targetTrackPoints[i];
-                                double alt = 0.0;
-                                try { if (targetTrackAlts != null && i < targetTrackAlts.Count) alt = targetTrackAlts[i]; } catch { }
-                                sb.AppendFormat(CultureInfo.InvariantCulture, "{0},{1},{2}\n", pt.Lng, pt.Lat, alt.ToString(CultureInfo.InvariantCulture));
+                                try
+                                {
+                                    if (tgt.TrackPoints == null || tgt.TrackPoints.Count == 0) continue;
+                                    sb.AppendLine("<Placemark>");
+                                    sb.AppendLine($"<name>{System.Security.SecurityElement.Escape(tgt.Name)} Track</name>");
+                                    sb.AppendLine("<styleUrl>#targetLine</styleUrl>");
+                                    sb.AppendLine("<LineString>");
+                                    sb.AppendLine("<tessellate>1</tessellate>");
+                                    sb.AppendLine("<coordinates>");
+                                    for (int i = 0; i < tgt.TrackPoints.Count; i++)
+                                    {
+                                        var pt = tgt.TrackPoints[i];
+                                        double alt = 0.0;
+                                        try { if (tgt.TrackAlts != null && i < tgt.TrackAlts.Count) alt = tgt.TrackAlts[i]; } catch { }
+                                        sb.AppendFormat(CultureInfo.InvariantCulture, "{0},{1},{2}\n", pt.Lng, pt.Lat, alt.ToString(CultureInfo.InvariantCulture));
+                                    }
+                                    sb.AppendLine("</coordinates>");
+                                    sb.AppendLine("</LineString>");
+                                    sb.AppendLine("</Placemark>");
+                                }
+                                catch { }
                             }
-                            sb.AppendLine("</coordinates>");
-                            sb.AppendLine("</LineString>");
-                            sb.AppendLine("</Placemark>");
                         }
                     }
                     catch { }
@@ -1906,10 +2176,26 @@ namespace CompanionPlugin
                 planeTrackPoints?.Clear();
                 targetTrackPoints?.Clear();
                 try { targetTrackAlts?.Clear(); } catch { }
+                // clear per-target swarm tracks
+                try {
+                    if (swarmTargets != null)
+                    {
+                        foreach (var t in swarmTargets)
+                        {
+                            try { t.TrackPoints?.Clear(); } catch { }
+                            try { t.TrackAlts?.Clear(); } catch { }
+                            try {
+                                if (overlay != null && t.Route != null && overlay.Routes.Contains(t.Route))
+                                    overlay.Routes.Remove(t.Route);
+                                t.Route = null;
+                            } catch { }
+                        }
+                    }
+                } catch { }
                 if (overlay != null)
                 {
                     try { if (planeRoute != null) { overlay.Routes.Remove(planeRoute); planeRoute = null; } } catch { }
-                    try { if (targetRoute != null) { overlay.Routes.Remove(targetRoute); targetRoute = null; } } catch { }
+                    try { targetRoute = null; } catch { }
                     try { RequestMapRefresh(); } catch { }
                 }
             }
@@ -1961,19 +2247,36 @@ namespace CompanionPlugin
             return true; // default visible
         }
 
-        // Ensure routes are present in overlay in a stable order: plane first, then target.
+        // Ensure routes are present in overlay in a stable order: plane first, then per-target routes.
         private void EnsureRoutesOverlayOrder()
         {
             try
             {
                 if (overlay == null) return;
-                // remove existing routes to control order
+                // remove plane route
                 try { if (planeRoute != null && overlay.Routes.Contains(planeRoute)) overlay.Routes.Remove(planeRoute); } catch { }
-                try { if (targetRoute != null && overlay.Routes.Contains(targetRoute)) overlay.Routes.Remove(targetRoute); } catch { }
+                // remove all per-target routes
+                try {
+                    if (swarmTargets != null)
+                    {
+                        foreach (var t in swarmTargets)
+                        {
+                            try { if (t.Route != null && overlay.Routes.Contains(t.Route)) overlay.Routes.Remove(t.Route); } catch { }
+                        }
+                    }
+                } catch { }
 
-                // add in fixed order: plane then target
+                // add in stable order: plane first, then each target
                 try { if (TracksPlaneVisible() && planeRoute != null) { try { SetRouteStyle(planeRoute, true); } catch { } overlay.Routes.Add(planeRoute); } } catch { }
-                try { if (TracksTargetVisible() && targetRoute != null) { try { SetRouteStyle(targetRoute, false); } catch { } overlay.Routes.Add(targetRoute); } } catch { }
+                try {
+                    if (TracksTargetVisible() && swarmTargets != null)
+                    {
+                        foreach (var t in swarmTargets)
+                        {
+                            try { if (t.Route != null && t.TrackPoints != null && t.TrackPoints.Count > 0) { SetRouteStyle(t.Route, false); overlay.Routes.Add(t.Route); } } catch { }
+                        }
+                    }
+                } catch { }
 
                 try { RequestMapRefresh(); } catch { }
             }
@@ -1998,82 +2301,116 @@ namespace CompanionPlugin
                     var control = FlightData.instance.gMapControl1;
                     if (m.Msg == WM_LBUTTONDOWN)
                     {
-                        // check if mouse over target marker
                         var pt = Control.MousePosition;
                         var local = control.PointToClient(pt);
-                            // check if mouse over target marker
-                            if (parent.targetMarker != null)
+                        // find the nearest swarm target marker under the mouse
+                        int hitIdx = -1;
+                        double bestDist2 = 24.0 * 24.0;
+                        try {
+                            if (parent.swarmTargets != null)
                             {
-                                var markPos = control.FromLatLngToLocal(parent.targetMarker.Position);
-                                var dx = markPos.X - local.X;
-                                var dy = markPos.Y - local.Y;
-                            if (dx * dx + dy * dy <= 20 * 20)
-                            {
-                                parent._isDraggingTarget = true;
-                                try { parent._prevCanDragMap = control.CanDragMap; control.CanDragMap = false; } catch { }
-                                return true; // consume
+                                for (int i = 0; i < parent.swarmTargets.Count; i++)
+                                {
+                                    var tm = parent.swarmTargets[i].MapMarker;
+                                    if (tm == null) continue;
+                                    var mp = control.FromLatLngToLocal(tm.Position);
+                                    double ddx = mp.X - local.X, ddy = mp.Y - local.Y;
+                                    double d2 = ddx * ddx + ddy * ddy;
+                                    if (d2 <= bestDist2) { bestDist2 = d2; hitIdx = i; }
+                                }
                             }
-                            }
-                            // check if mouse over plane marker
-                            if (parent.planeMarker != null)
-                            {
-                                var markPos2 = control.FromLatLngToLocal(parent.planeMarker.Position);
-                                var dx2 = markPos2.X - local.X;
-                                var dy2 = markPos2.Y - local.Y;
-                                // use larger hit radius for plane (icon may be larger)
-                            if (dx2 * dx2 + dy2 * dy2 <= 30 * 30)
+                        } catch { }
+                        if (hitIdx >= 0)
+                        {
+                            parent._isDraggingTarget = true;
+                            parent._draggingTargetIdx = hitIdx;
+                            try { parent._prevCanDragMap = control.CanDragMap; control.CanDragMap = false; } catch { }
+                            return true;
+                        }
+                        // check plane marker
+                        if (parent.planeMarker != null)
+                        {
+                            var mp2 = control.FromLatLngToLocal(parent.planeMarker.Position);
+                            double dx2 = mp2.X - local.X, dy2 = mp2.Y - local.Y;
+                            if (dx2 * dx2 + dy2 * dy2 <= 30.0 * 30.0)
                             {
                                 parent._isDraggingPlane = true;
                                 try { parent._prevCanDragMap = control.CanDragMap; control.CanDragMap = false; } catch { }
-                                return true; // consume
+                                return true;
                             }
-                            }
+                        }
                     }
                     else if (m.Msg == WM_MOUSEMOVE)
                     {
-                            if (parent._isDraggingTarget)
-                            {
-                                var pt = Control.MousePosition;
-                                var local = control.PointToClient(pt);
-                                var p = control.FromLocalToLatLng(local.X, local.Y);
-                                try { parent.targetMarker.Position = p; } catch { }
-                                try { if (parent.targetAltMarker != null) parent.targetAltMarker.Position = p; } catch { }
-                                try { control.Refresh(); } catch { try { parent.RequestMapRefresh(); } catch { } }
-                                return true; // consume
-                            }
-                            else if (parent._isDraggingPlane)
-                            {
-                                var pt2 = Control.MousePosition;
-                                var local2 = control.PointToClient(pt2);
-                                var p2 = control.FromLocalToLatLng(local2.X, local2.Y);
-                                try { parent.planeMarker.Position = p2; } catch { }
-                                try { if (parent.planeAltMarker != null) parent.planeAltMarker.Position = p2; } catch { }
-                                try { control.Refresh(); } catch { try { parent.RequestMapRefresh(); } catch { } }
-                                return true;
-                            }
+                        if (parent._isDraggingTarget)
+                        {
+                            var pt = Control.MousePosition;
+                            var local = control.PointToClient(pt);
+                            var p = control.FromLocalToLatLng(local.X, local.Y);
+                            try {
+                                int dIdx = parent._draggingTargetIdx;
+                                if (parent.swarmTargets != null && dIdx >= 0 && dIdx < parent.swarmTargets.Count)
+                                {
+                                    var t = parent.swarmTargets[dIdx];
+                                    try { if (t.MapMarker != null) t.MapMarker.Position = p; } catch { }
+                                    try { if (t.AltMarker != null) t.AltMarker.Position = p; } catch { }
+                                }
+                            } catch { }
+                            try { control.Refresh(); } catch { try { parent.RequestMapRefresh(); } catch { } }
+                            return true;
+                        }
+                        else if (parent._isDraggingPlane)
+                        {
+                            var pt2 = Control.MousePosition;
+                            var local2 = control.PointToClient(pt2);
+                            var p2 = control.FromLocalToLatLng(local2.X, local2.Y);
+                            try { parent.planeMarker.Position = p2; } catch { }
+                            try { if (parent.planeAltMarker != null) parent.planeAltMarker.Position = p2; } catch { }
+                            try { control.Refresh(); } catch { try { parent.RequestMapRefresh(); } catch { } }
+                            return true;
+                        }
                     }
                     else if (m.Msg == WM_LBUTTONUP)
                     {
-                            if (parent._isDraggingTarget)
-                            {
-                                parent._isDraggingTarget = false;
-                                var pt = Control.MousePosition;
-                                var local = control.PointToClient(pt);
-                                var p = control.FromLocalToLatLng(local.X, local.Y);
+                        if (parent._isDraggingTarget)
+                        {
+                            parent._isDraggingTarget = false;
+                            int dragIdx = parent._draggingTargetIdx;
+                            parent._draggingTargetIdx = -1;
+                            var pt = Control.MousePosition;
+                            var local = control.PointToClient(pt);
+                            var p = control.FromLocalToLatLng(local.X, local.Y);
+                            // commit dragged position into swarm data
+                            try {
+                                if (parent.swarmTargets != null && dragIdx >= 0 && dragIdx < parent.swarmTargets.Count)
+                                {
+                                    parent.swarmTargets[dragIdx].Lat = p.Lat;
+                                    parent.swarmTargets[dragIdx].Lon = p.Lng;
+                                }
+                            } catch { }
+                            // dragging updates target position but does NOT switch active target
+                            // if dragged target IS already active, persist and send gimbal
+                            if (dragIdx == parent.activeTargetIdx)
                                 try { parent.UpdateTargetMarker(p, true); } catch { }
-                                try { control.CanDragMap = parent._prevCanDragMap; } catch { }
-                                return true; // consume
-                            }
-                            else if (parent._isDraggingPlane)
+                            else
                             {
-                                parent._isDraggingPlane = false;
-                                var pt2 = Control.MousePosition;
-                                var local2 = control.PointToClient(pt2);
-                                var p2 = control.FromLocalToLatLng(local2.X, local2.Y);
-                                try { parent.UpdatePlaneMarker(p2, true); } catch { }
-                                try { control.CanDragMap = parent._prevCanDragMap; } catch { }
-                                return true;
+                                // just save and refresh markers without switching
+                                try { parent.SaveSwarmTargets(); } catch { }
+                                try { parent.RefreshAllTargetMarkers(); } catch { }
                             }
+                            try { control.CanDragMap = parent._prevCanDragMap; } catch { }
+                            return true;
+                        }
+                        else if (parent._isDraggingPlane)
+                        {
+                            parent._isDraggingPlane = false;
+                            var pt2 = Control.MousePosition;
+                            var local2 = control.PointToClient(pt2);
+                            var p2 = control.FromLocalToLatLng(local2.X, local2.Y);
+                            try { parent.UpdatePlaneMarker(p2, true); } catch { }
+                            try { control.CanDragMap = parent._prevCanDragMap; } catch { }
+                            return true;
+                        }
                     }
                 }
                 catch { }
@@ -2105,12 +2442,18 @@ namespace CompanionPlugin
             {
                 // respect global enable checkbox: do not record when tracks disabled
                 try { if (!TracksEnabled()) return; } catch { }
-                if (targetTrackPoints == null) targetTrackPoints = new List<PointLatLng>();
+
+                // route to active swarm target's per-target track
+                SwarmTarget tgt = null;
+                try { if (swarmTargets != null && activeTargetIdx >= 0 && activeTargetIdx < swarmTargets.Count) tgt = swarmTargets[activeTargetIdx]; } catch { }
+                if (tgt == null) return;
+
+                if (tgt.TrackPoints == null) tgt.TrackPoints = new List<PointLatLng>();
                 bool addt = false;
-                if (targetTrackPoints.Count == 0) addt = true;
+                if (tgt.TrackPoints.Count == 0) addt = true;
                 else
                 {
-                    var lastt = targetTrackPoints[targetTrackPoints.Count - 1];
+                    var lastt = tgt.TrackPoints[tgt.TrackPoints.Count - 1];
                     double dt = HaversineDistanceMeters(lastt.Lat, lastt.Lng, p.Lat, p.Lng);
                     if (dt >= 1.0) addt = true;
                 }
@@ -2132,36 +2475,39 @@ namespace CompanionPlugin
                 try
                 {
                     double eps = 1e-6;
-                    if (targetTrackPoints.Count > 0)
+                    if (tgt.TrackPoints.Count > 0)
                     {
-                        var lastt = targetTrackPoints[targetTrackPoints.Count - 1];
-                        if (Math.Abs(lastt.Lat - p.Lat) < eps && Math.Abs(lastt.Lng - p.Lng) < eps)
-                        {
-                            return;
-                        }
+                        var lastt = tgt.TrackPoints[tgt.TrackPoints.Count - 1];
+                        if (Math.Abs(lastt.Lat - p.Lat) < eps && Math.Abs(lastt.Lng - p.Lng) < eps) return;
                     }
                 }
                 catch { }
 
-                targetTrackPoints.Add(p);
-                try { if (targetTrackAlts == null) targetTrackAlts = new List<double>(); targetTrackAlts.Add(double.IsNaN(targetAlt) ? 0.0 : targetAlt); } catch { }
-                try { Trace.WriteLine($"TargetTrack add: {p.Lat.ToString(CultureInfo.InvariantCulture)},{p.Lng.ToString(CultureInfo.InvariantCulture)}"); } catch { }
+                tgt.TrackPoints.Add(p);
+                try { if (tgt.TrackAlts == null) tgt.TrackAlts = new List<double>(); tgt.TrackAlts.Add(double.IsNaN(tgt.Alt) ? 0.0 : tgt.Alt); } catch { }
+                try { Trace.WriteLine($"TargetTrack[{tgt.Name}] add: {p.Lat.ToString(CultureInfo.InvariantCulture)},{p.Lng.ToString(CultureInfo.InvariantCulture)}"); } catch { }
 
-                if (targetRoute == null) targetRoute = new GMapRoute(targetTrackPoints, "targetTrack");
-                targetRoute.Points.Clear();
-                targetRoute.Points.AddRange(targetTrackPoints);
-                try { try { SetRouteStyle(targetRoute, false); } catch { } } catch { }
+                // also maintain legacy targetTrackPoints for backward compat
+                try { if (targetTrackPoints != null) { targetTrackPoints.Clear(); targetTrackPoints.AddRange(tgt.TrackPoints); } } catch { }
+
+                if (tgt.Route == null) tgt.Route = new GMapRoute(tgt.TrackPoints, "targetTrack_" + tgt.Name);
+                tgt.Route.Points.Clear();
+                tgt.Route.Points.AddRange(tgt.TrackPoints);
+                try { SetRouteStyle(tgt.Route, false); } catch { }
+
+                // also update legacy targetRoute alias
+                try { targetRoute = tgt.Route; } catch { }
 
                 if (overlay != null)
                 {
                     if (TracksTargetVisible())
                     {
-                        try { if (overlay.Routes.Contains(targetRoute)) overlay.Routes.Remove(targetRoute); } catch { }
-                        try { try { SetRouteStyle(targetRoute, false); } catch { } overlay.Routes.Add(targetRoute); } catch { }
+                        try { if (overlay.Routes.Contains(tgt.Route)) overlay.Routes.Remove(tgt.Route); } catch { }
+                        try { SetRouteStyle(tgt.Route, false); overlay.Routes.Add(tgt.Route); } catch { }
                     }
                     else
                     {
-                        try { if (overlay.Routes.Contains(targetRoute)) overlay.Routes.Remove(targetRoute); } catch { }
+                        try { if (overlay.Routes.Contains(tgt.Route)) overlay.Routes.Remove(tgt.Route); } catch { }
                     }
                     try { EnsureRoutesOverlayOrder(); } catch { }
                     try { RequestMapRefresh(); } catch { }
@@ -2295,8 +2641,8 @@ namespace CompanionPlugin
 
                 float pitch = (float)pitchDeg;
                 const float roll = 0.0f;
-                // normalize yaw into [0,360)
-                double yawd = ((yawDeg % 360.0) + 360.0) % 360.0;
+                // normalize yaw into [0,360), applying calibration offset
+                double yawd = (((yawDeg + gimbalYawCalibOffset) % 360.0) + 360.0) % 360.0;
                 float yaw = (float)yawd;
                 const float p4 = 0.0f;
                 const float p5 = 0.0f;
@@ -2670,6 +3016,60 @@ namespace CompanionPlugin
             return bmp;
         }
 
+        // Creates a tinted plane icon from the planeicon resource.
+        // highlight=true draws a white ring around it (used for active target).
+        private Bitmap CreateColoredPlaneBitmap(Color tint, int size, bool highlight)
+        {
+            try
+            {
+                Bitmap src = null;
+                try { src = global::MissionPlanner.Properties.Resources.planeicon; } catch { }
+                int totalSize = highlight ? size + 10 : size;
+                int iconOffset = highlight ? 5 : 0;
+                var result = new Bitmap(totalSize, totalSize);
+                using (var g = Graphics.FromImage(result))
+                {
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    g.Clear(Color.Transparent);
+                    if (highlight)
+                    {
+                        using (var pen = new Pen(Color.White, 3f))
+                            g.DrawEllipse(pen, 1, 1, totalSize - 3, totalSize - 3);
+                    }
+                    if (src != null)
+                    {
+                        // Silhouette recolor: replace all RGB with pure tint color, keep original alpha.
+                        // This gives full-brightness vivid color regardless of the source image's own colors.
+                        float r = tint.R / 255f, gf = tint.G / 255f, b = tint.B / 255f;
+                        var cm = new System.Drawing.Imaging.ColorMatrix(new float[][] {
+                            new float[] { 0,  0,  0,  0, 0 },   // zero out input R/G/B contribution to R
+                            new float[] { 0,  0,  0,  0, 0 },
+                            new float[] { 0,  0,  0,  0, 0 },
+                            new float[] { 0,  0,  0,  1, 0 },   // keep alpha unchanged
+                            new float[] { r, gf,  b,  0, 1 }    // add constant tint to every pixel
+                        });
+                        var ia = new System.Drawing.Imaging.ImageAttributes();
+                        ia.SetColorMatrix(cm);
+                        using (var scaled = new Bitmap(src, new Size(size, size)))
+                            g.DrawImage(scaled, new Rectangle(iconOffset, iconOffset, size, size),
+                                0, 0, size, size, GraphicsUnit.Pixel, ia);
+                    }
+                    else
+                    {
+                        int pad = Math.Max(2, size / 8);
+                        using (var brush = new SolidBrush(tint))
+                            g.FillEllipse(brush, iconOffset + pad, iconOffset + pad, size - pad * 2, size - pad * 2);
+                    }
+                }
+                return result;
+            }
+            catch
+            {
+                try { return CreateCircleIcon(tint, highlight ? size + 6 : size); } catch { }
+                return new Bitmap(Math.Max(1, size), Math.Max(1, size));
+            }
+        }
+
         private void StopServer()
         {
             try
@@ -2713,6 +3113,311 @@ namespace CompanionPlugin
             catch (Exception ex) { Trace.WriteLine("StopServer error: " + ex.Message); }
         }
 
+        // ---- Swarm multi-target methods ----
+
+        private void LoadSwarmTargets()
+        {
+            try
+            {
+                var s = MissionPlanner.Utilities.Settings.Instance;
+                var json = s["Companion_swarm_targets"]?.ToString();
+                if (!string.IsNullOrEmpty(json))
+                {
+                    try
+                    {
+                        var list = JsonConvert.DeserializeObject<List<SwarmTarget>>(json);
+                        if (list != null && list.Count > 0)
+                        {
+                            swarmTargets = list;
+                            // init non-serialized fields
+                            foreach (var t in swarmTargets)
+                            {
+                                t.TrackPoints = t.TrackPoints ?? new List<PointLatLng>();
+                                t.TrackAlts = t.TrackAlts ?? new List<double>();
+                            }
+                            // load active index
+                            int idx = 0;
+                            if (s["Companion_active_target_idx"] != null)
+                                int.TryParse(s["Companion_active_target_idx"].ToString(), out idx);
+                            activeTargetIdx = Math.Max(0, Math.Min(idx, swarmTargets.Count - 1));
+                            _lastActiveTargetIdxFromSettings = activeTargetIdx;
+                            // sync globals from active target
+                            var active = swarmTargets[activeTargetIdx];
+                            lock (stateLock) { targetLat = active.Lat; targetLon = active.Lon; targetAlt = active.Alt; }
+                            // create all target markers via swarm system
+                            try { RefreshAllTargetMarkers(); } catch { }
+                            return;
+                        }
+                    }
+                    catch { }
+                }
+                // no swarm data: migrate legacy single-target settings
+                var t1 = new SwarmTarget() { Name = "Target 1", Lat = double.NaN, Lon = double.NaN, Alt = 0.0 };
+                try
+                {
+                    if (s["Companion_target_lat"] != null && s["Companion_target_lon"] != null)
+                    {
+                        double lat, lon;
+                        if (double.TryParse(s["Companion_target_lat"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out lat) &&
+                            double.TryParse(s["Companion_target_lon"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out lon))
+                        {
+                            t1.Lat = lat; t1.Lon = lon;
+                        }
+                    }
+                    if (s["Companion_target_alt"] != null)
+                    {
+                        double altv;
+                        if (double.TryParse(s["Companion_target_alt"].ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out altv))
+                            t1.Alt = altv;
+                    }
+                }
+                catch { }
+                swarmTargets = new List<SwarmTarget>() { t1 };
+                activeTargetIdx = 0;
+                _lastActiveTargetIdxFromSettings = 0;
+                lock (stateLock) { targetLat = t1.Lat; targetLon = t1.Lon; targetAlt = t1.Alt; }
+                if (!double.IsNaN(t1.Lat) && !double.IsNaN(t1.Lon))
+                    try { RefreshAllTargetMarkers(); } catch { }
+                SaveSwarmTargets();
+            }
+            catch { }
+        }
+
+        private void SaveSwarmTargets()
+        {
+            try
+            {
+                var s = MissionPlanner.Utilities.Settings.Instance;
+                // serialize only public persisted fields; [JsonIgnore] markers/routes are excluded
+                var json = JsonConvert.SerializeObject(swarmTargets);
+                s["Companion_swarm_targets"] = json;
+                s["Companion_active_target_idx"] = activeTargetIdx.ToString(CultureInfo.InvariantCulture);
+                try { s.Save(); } catch { }
+            }
+            catch { }
+        }
+
+        private void SwitchToTarget(int idx)
+        {
+            try
+            {
+                if (swarmTargets == null || swarmTargets.Count == 0) return;
+                idx = Math.Max(0, Math.Min(idx, swarmTargets.Count - 1));
+                activeTargetIdx = idx;
+                _lastActiveTargetIdxFromSettings = idx;
+                var t = swarmTargets[idx];
+                lock (stateLock) { targetLat = t.Lat; targetLon = t.Lon; targetAlt = t.Alt; }
+                SaveSwarmTargets();
+
+                // update UI controls
+                try {
+                    if (nudTargetAlt != null)
+                    {
+                        var v = (decimal)t.Alt;
+                        if (v < nudTargetAlt.Minimum) v = nudTargetAlt.Minimum;
+                        if (v > nudTargetAlt.Maximum) v = nudTargetAlt.Maximum;
+                        nudTargetAlt.Value = v;
+                    }
+                } catch { }
+                try {
+                    if (tabLblTarget != null)
+                        tabLblTarget.Text = double.IsNaN(t.Lat) ? $"{t.Name}: not set" : $"{t.Name}: {t.Lat:F6}, {t.Lon:F6}";
+                } catch { }
+
+                // update the active map marker alias so drag/drop and legacy code still works
+                try {
+                    if (t.MapMarker != null) targetMarker = t.MapMarker;
+                    if (t.AltMarker != null) targetAltMarker = t.AltMarker;
+                    targetRoute = t.Route;
+                } catch { }
+
+                RefreshAllTargetMarkers();
+                RefreshTargetListUI();
+
+                // send gimbal to new target
+                try {
+                    double bearing = ComputeBearing(planeLat, planeLon, targetLat, targetLon);
+                    if (!double.IsNaN(bearing))
+                    {
+                        double pitch = ComputePitch(planeLat, planeLon, planeAlt, targetLat, targetLon, targetAlt);
+                        SendGimbal((float)pitch, (float)bearing);
+                    }
+                } catch { }
+
+                try { BroadcastPositions(); } catch { }
+                try { UpdateMapDistanceLabel(); } catch { }
+            }
+            catch { }
+        }
+
+        private void RefreshTargetListUI()
+        {
+            try
+            {
+                if (lstTargets == null) return;
+                Action act = () => {
+                    try {
+                        int prevSel = lstTargets.SelectedIndex;
+                        lstTargets.BeginUpdate();
+                        lstTargets.Items.Clear();
+                        if (swarmTargets != null)
+                        {
+                            for (int i = 0; i < swarmTargets.Count; i++)
+                            {
+                                var t = swarmTargets[i];
+                                string label = (i == activeTargetIdx ? "● " : "  ") + t.Name;
+                                lstTargets.Items.Add(label);
+                            }
+                        }
+                        lstTargets.EndUpdate();
+                        // restore selection without triggering SwitchToTarget
+                        try {
+                            if (activeTargetIdx >= 0 && activeTargetIdx < lstTargets.Items.Count)
+                                lstTargets.SelectedIndex = activeTargetIdx;
+                        } catch { }
+                    } catch { }
+                };
+                try { if (lstTargets.InvokeRequired) lstTargets.BeginInvoke(act); else act(); } catch { try { act(); } catch { } }
+            }
+            catch { }
+        }
+
+        private void RefreshAllTargetMarkers()
+        {
+            try
+            {
+                if (overlay == null || swarmTargets == null) return;
+                for (int i = 0; i < swarmTargets.Count; i++)
+                {
+                    var t = swarmTargets[i];
+                    bool isActive = (i == activeTargetIdx);
+                    try {
+                        // If active state changed, remove the old marker so it gets recreated with new icon
+                        if (t.MapMarker != null && t.WasActive != isActive)
+                        {
+                            try { if (overlay.Markers.Contains(t.MapMarker)) overlay.Markers.Remove(t.MapMarker); } catch { }
+                            t.MapMarker = null;
+                        }
+                        if (!double.IsNaN(t.Lat) && !double.IsNaN(t.Lon))
+                        {
+                            var pos = new PointLatLng(t.Lat, t.Lon);
+                            if (t.MapMarker == null)
+                            {
+                                // Active = full-size (56px) with highlight ring; inactive = smaller (40px)
+                                Color tintColor = TargetColors[i % TargetColors.Length];
+                                int iconSize = 56; // same size for all targets; highlight ring distinguishes active
+                                Bitmap bmp = null;
+                                try { bmp = CreateColoredPlaneBitmap(tintColor, iconSize, isActive); } catch { }
+                                if (bmp != null)
+                                {
+                                    t.MapMarker = new GMarkerGoogle(pos, bmp) { ToolTipText = t.Name };
+                                    t.MapMarker.Offset = new Point(-bmp.Width / 2, -bmp.Height / 2);
+                                }
+                                else
+                                {
+                                    t.MapMarker = new GMarkerGoogle(pos, isActive ? GMarkerGoogleType.blue_pushpin : GMarkerGoogleType.gray_small) { ToolTipText = t.Name };
+                                }
+                                overlay.Markers.Add(t.MapMarker);
+                            }
+                            else
+                            {
+                                t.MapMarker.Position = pos;
+                                t.MapMarker.ToolTipText = t.Name;
+                            }
+                            t.WasActive = isActive;
+                            // altitude label marker
+                            string lbl = $"[{t.Name}] {t.Alt:F1} m";
+                            if (t.AltMarker == null)
+                            {
+                                t.AltMarker = new GMapMarkerText(pos, lbl) { PixelOffset = new Point(12, 12) };
+                                overlay.Markers.Add(t.AltMarker);
+                            }
+                            else
+                            {
+                                t.AltMarker.Position = pos;
+                                try { (t.AltMarker as GMapMarkerText).Text = lbl; } catch { }
+                            }
+                        }
+                    } catch { }
+                }
+                // update legacy aliases to active target
+                try {
+                    var active = swarmTargets[activeTargetIdx];
+                    targetMarker = active.MapMarker;
+                    targetAltMarker = active.AltMarker;
+                    targetRoute = active.Route;
+                } catch { }
+                try { RequestMapRefresh(); } catch { }
+            }
+            catch { }
+        }
+
+        // ---- End swarm methods ----
+
+        private void StartMavp2p()
+        {
+            try
+            {
+                const string settingsKey = "Companion_mavp2p_path";
+                var s = MissionPlanner.Utilities.Settings.Instance;
+                string exePath = s[settingsKey] != null ? s[settingsKey].ToString() : null;
+
+                // validate saved path
+                if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
+                {
+                    exePath = null;
+                    // ask user to locate mavp2p.exe
+                    string selected = null;
+                    var invokeTarget = FlightData.instance != null ? (Control)FlightData.instance : null;
+                    Action showDialog = () =>
+                    {
+                        using (var ofd = new OpenFileDialog())
+                        {
+                            ofd.Title = "Locate mavp2p.exe";
+                            ofd.Filter = "mavp2p.exe|mavp2p.exe|Executables (*.exe)|*.exe|All files (*.*)|*.*";
+                            ofd.FileName = "mavp2p.exe";
+                            if (ofd.ShowDialog() == DialogResult.OK)
+                                selected = ofd.FileName;
+                        }
+                    };
+                    if (invokeTarget != null && invokeTarget.InvokeRequired)
+                        invokeTarget.Invoke(showDialog);
+                    else
+                        showDialog();
+
+                    if (string.IsNullOrEmpty(selected) || !File.Exists(selected))
+                    {
+                        Trace.WriteLine("CompanionPlugin: mavp2p.exe not selected, skipping launch.");
+                        return;
+                    }
+                    exePath = selected;
+                    s[settingsKey] = exePath;
+                }
+
+                // kill any previously running instance we started
+                try
+                {
+                    if (_mavp2pProcess != null && !_mavp2pProcess.HasExited)
+                        _mavp2pProcess.Kill();
+                }
+                catch { }
+                _mavp2pProcess = null;
+
+                var psi = new ProcessStartInfo(exePath, "tcpc:192.168.2.2:5760 udps:0.0.0.0:14446")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetDirectoryName(exePath)
+                };
+                _mavp2pProcess = Process.Start(psi);
+                Trace.WriteLine($"CompanionPlugin: started mavp2p pid={_mavp2pProcess?.Id}");
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine("CompanionPlugin: failed to start mavp2p: " + ex.Message);
+            }
+        }
+
         public override bool Exit()
         {
             try
@@ -2722,7 +3427,9 @@ namespace CompanionPlugin
                 {
                     try {
                         try { if (planeRoute != null) { overlay.Routes.Remove(planeRoute); planeRoute = null; } } catch { }
-                        try { if (targetRoute != null) { overlay.Routes.Remove(targetRoute); targetRoute = null; } } catch { }
+                        try { targetRoute = null; } catch { }
+                        // remove per-target swarm routes
+                        try { if (swarmTargets != null) { foreach (var t in swarmTargets) { try { if (t.Route != null && overlay.Routes.Contains(t.Route)) { overlay.Routes.Remove(t.Route); } t.Route = null; } catch { } } } } catch { }
                         try { planeTrackPoints?.Clear(); } catch { }
                         try { targetTrackPoints?.Clear(); } catch { }
                         try { planeTrackAlts?.Clear(); } catch { }
@@ -2739,7 +3446,37 @@ namespace CompanionPlugin
                 try { if (targetBmp != null) { targetBmp.Dispose(); targetBmp = null; } } catch { }
             }
             catch { }
+            try
+            {
+                if (_linkAppBtn != null && MainV2.instance != null && MainV2.instance.MainMenu != null)
+                    MainV2.instance.MainMenu.Items.Remove(_linkAppBtn);
+            }
+            catch { }
+            _linkAppBtn = null;
+            _linkAppProcess = null;
+            try
+            {
+                if (_mavp2pProcess != null && !_mavp2pProcess.HasExited)
+                    _mavp2pProcess.Kill();
+            }
+            catch { }
+            _mavp2pProcess = null;
             return true;
+        }
+
+        // Swarm target data model (persisted fields only; map objects are [JsonIgnore])
+        private class SwarmTarget
+        {
+            public string Name = "Target";
+            public double Lat = double.NaN;
+            public double Lon = double.NaN;
+            public double Alt = 0.0;
+            [JsonIgnore] public GMarkerGoogle MapMarker;
+            [JsonIgnore] public GMapMarkerText AltMarker;
+            [JsonIgnore] public GMapRoute Route;
+            [JsonIgnore] public List<PointLatLng> TrackPoints = new List<PointLatLng>();
+            [JsonIgnore] public List<double> TrackAlts = new List<double>();
+            [JsonIgnore] public bool WasActive = false; // tracks whether marker was created as active; triggers recreation when state changes
         }
     }
 

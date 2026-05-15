@@ -24,8 +24,6 @@ namespace MissionPlanner.plugins
         private Panel _tabHostPanel;
         private Esp32VtxControlView _view;
         private VtxPluginStateStore _stateStore;
-        private bool _wasConnected = false;
-        private string _lastMode = null;
 
         public override string Name
         {
@@ -157,24 +155,7 @@ namespace MissionPlanner.plugins
                     _view.EnsureMapQuickControlsHosted();
                 }
 
-                var isConnected = MainV2.comPort != null
-                    && MainV2.comPort.BaseStream != null
-                    && MainV2.comPort.BaseStream.IsOpen;
-                if (isConnected && !_wasConnected && _view != null)
-                {
-                    _view.AutoSendOnConnect();
-                }
-                _wasConnected = isConnected;
 
-                var currentMode = MainV2.comPort?.MAV?.cs?.mode;
-                if (_lastMode == "INITIALISING"
-                    && !string.IsNullOrEmpty(currentMode)
-                    && currentMode != "INITIALISING"
-                    && _view != null)
-                {
-                    _view.AutoSendOnConnect();
-                }
-                _lastMode = currentMode;
             }
             catch (Exception ex)
             {

@@ -32,6 +32,17 @@ namespace KeyBinder
 
         private const string KB_INC_TARGET_ALT = "KeyBinder: Increase Target Alt";
         private const string KB_DEC_TARGET_ALT = "KeyBinder: Decrease Target Alt";
+        private static readonly string[] KB_SWITCH_TARGET = new string[]
+        {
+            "KeyBinder: Switch to Target 1",
+            "KeyBinder: Switch to Target 2",
+            "KeyBinder: Switch to Target 3",
+            "KeyBinder: Switch to Target 4",
+            "KeyBinder: Switch to Target 5",
+            "KeyBinder: Switch to Target 6",
+            "KeyBinder: Switch to Target 7",
+            "KeyBinder: Switch to Target 8",
+        };
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
@@ -194,6 +205,16 @@ namespace KeyBinder
                 if (string.IsNullOrEmpty(path)) return;
                 if (path == KB_INC_TARGET_ALT) { AdjustTargetAlt(1.0); return; }
                 if (path == KB_DEC_TARGET_ALT) { AdjustTargetAlt(-1.0); return; }
+                // switch to target N (0-based index written to Companion_active_target_idx)
+                if (path.StartsWith("KeyBinder: Switch to Target "))
+                {
+                    try {
+                        int n;
+                        if (int.TryParse(path.Substring("KeyBinder: Switch to Target ".Length), out n) && n >= 1)
+                            SwitchTarget(n - 1);
+                    } catch { }
+                    return;
+                }
                 var item = FindMenuItemByPath(path);
                 if (item != null)
                 {
@@ -214,6 +235,17 @@ namespace KeyBinder
                 // clamp to reasonable range
                 cur = Math.Max(-10000.0, Math.Min(100000.0, cur));
                 st["Companion_target_alt"] = cur.ToString(CultureInfo.InvariantCulture);
+                try { st.Save(); } catch { }
+            }
+            catch { }
+        }
+
+        private void SwitchTarget(int zeroBasedIdx)
+        {
+            try
+            {
+                var st = Settings.Instance;
+                st["Companion_active_target_idx"] = zeroBasedIdx.ToString(CultureInfo.InvariantCulture);
                 try { st.Save(); } catch { }
             }
             catch { }
@@ -362,9 +394,15 @@ namespace KeyBinder
             // add KeyBinder-specific actions first
             menuCombo.Items.Add(KB_INC_TARGET_ALT);
             menuCombo.Items.Add(KB_DEC_TARGET_ALT);
+            // add switch-to-target hotkey slots
+            foreach (var a in KB_SWITCH_TARGET) menuCombo.Items.Add(a);
             // populate with menu paths
-            var items = EnumerateMenuPaths(Host.FDMenuMap.Items);
-            foreach (var it in items) menuCombo.Items.Add(it);
+            try
+            {
+                var items = EnumerateMenuPaths(Host.FDMenuMap.Items);
+                foreach (var it in items) menuCombo.Items.Add(it);
+            }
+            catch { /* menu not available yet — KeyBinder items still present */ }
             if (menuCombo.Items.Count > 0) menuCombo.SelectedIndex = 0;
 
             var ok = new Button() { Text = "OK", Left = 300, Top = 180, Width = 80, DialogResult = DialogResult.OK };
